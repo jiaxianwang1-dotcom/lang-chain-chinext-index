@@ -8,9 +8,17 @@
     "memory": "tsx memory.ts",
     "long-memory": "tsx long-memory.ts",
     "compressed-memory": "tsx compressed-memory.ts",
-    "web": "tsx web-agent.ts"
+    "web": "tsx web-agent.ts",
+    "stock": "tsx src/agent/stock/main.ts",
+    "stock:once": "tsx src/agent/stock/main.ts --once",
+    "stock:dry-run": "tsx src/agent/stock/main.ts --once --dry-run",
+    "stock:self-check": "tsx src/agent/stock/main.ts --self-check",
+    "test": "vitest run"
   },
   "dependencies": {
+    "@alicloud/dysmsapi20170525": "^3.0.0",
+    "@alicloud/openapi-client": "^0.4.0",
+    "@alicloud/tea-util": "^1.4.7",
     "@langchain/core": "^0.3.0",
     "@langchain/langgraph": "^0.3.0",
     "@langchain/openai": "^0.5.0",
@@ -18,11 +26,14 @@
     "dotenv": "^16.0.0",
     "express": "^5.2.1",
     "langchain": "^0.3.0",
+    "node-cron": "^3.0.3",
     "zod": "^3.23.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/express": "^5.0.6",
-    "tsx": "^4.0.0"
+    "@types/node-cron": "^3.0.11",
+    "tsx": "^4.0.0",
+    "vitest": "^2.1.0"
   }
 }

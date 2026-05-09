@@ -1,6 +1,53 @@
 # langgraph-agent
 
+## 指数预测智能体（stock-index-agent）
 
+基于 LangGraph 的 A 股指数（上证指数 / 创业板指）预测智能体，每个交易日 14:00 自动采集行情、用 LLM + 联网搜索分析涨跌原因，并对下一交易日方向（买涨 / 买跌）输出预测，最终通过短信推送到 `SMS_PHONE`。
+
+### 一、配置环境变量
+
+复制 `.env.example` 为 `.env` 并填写以下字段（仅与短信相关，其余沿用现有配置）：
+
+```
+SMS_PROVIDER=aliyun                # 当前仅支持阿里云
+SMS_ACCESS_KEY_ID=...              # 阿里云 AccessKey
+SMS_ACCESS_KEY_SECRET=...
+SMS_SIGN_NAME=...                  # 已审核通过的签名
+SMS_TEMPLATE_CODE=SMS_xxx          # 已审核通过的模板 CODE
+SMS_PHONE=15136489941              # 接收短信的手机号
+```
+
+短信模板需要包含两个变量占位符 `${content}`、`${time}`，例如：
+
+> 【签名】指数预测：${content}（${time}）。仅供参考，非投资建议。
+
+### 二、运行
+
+```bash
+# 一次性跑通：采集 + 归因 + 预测 + 短信（首次会自动回填近 1 年历史）
+npm run stock:once
+
+# Dry-run：只打印短信内容，不真正调用阿里云
+npm run stock:dry-run
+
+# 自检：仅初始化数据库与表结构，验证依赖可用
+npm run stock:self-check
+
+# 常驻：启动后注册 cron（北京时间每个交易日 14:00 触发完整流程）
+npm run stock
+```
+
+数据存放在 `.memory/stock_agent.db`（与通用 agent 的 `web_agent.db` 隔离）。
+
+### 三、风险声明
+
+- 本智能体仅基于公开行情数据 + 联网搜索 + LLM 启发式分析，**不构成投资建议**。
+- 个人本地部署，需要进程常驻。建议用 PM2 / systemd / 服务器托管以避免笔记本休眠导致 cron 漏触发。
+- LLM 与免费行情接口都可能不稳定，所有预测结果均带"置信度"，请自行评估后再做投资决策。
+
+更多细节见 [`openspec/changes/add-stock-index-agent/`](./openspec/changes/add-stock-index-agent/) 与（实现完成后）`docs/stock-index-agent.md`。
+
+---
 
 ## Getting started
 
