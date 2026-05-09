@@ -1,0 +1,28 @@
+{
+  "name": "lang-chain-graph",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "npx @langchain/langgraph-cli dev",
+    "start": "tsx agent.ts \"请识别这张图片，用 recognize_image 工具返回结构化数据\" \"/Users/liuli/Downloads/sku打包聚合图.png\"",
+    "memory": "tsx memory.ts",
+    "long-memory": "tsx long-memory.ts",
+    "compressed-memory": "tsx compressed-memory.ts",
+    "web": "tsx web-agent.ts"
+  },
+  "dependencies": {
+    "@langchain/core": "^0.3.0",
+    "@langchain/langgraph": "^0.3.0",
+    "@langchain/openai": "^0.5.0",
+    "better-sqlite3": "^12.9.0",
+    "dotenv": "^16.0.0",
+    "express": "^5.2.1",
+    "langchain": "^0.3.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.6",
+    "tsx": "^4.0.0"
+  }
+}
