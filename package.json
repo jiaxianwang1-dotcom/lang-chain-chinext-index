@@ -3,11 +3,6 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "npx @langchain/langgraph-cli dev",
-    "start": "tsx agent.ts \"请识别这张图片，用 recognize_image 工具返回结构化数据\" \"/Users/liuli/Downloads/sku打包聚合图.png\"",
-    "memory": "tsx memory.ts",
-    "long-memory": "tsx long-memory.ts",
-    "compressed-memory": "tsx compressed-memory.ts",
     "web": "tsx web-agent.ts",
     "stock": "tsx src/agent/stock/main.ts",
     "stock:once": "tsx src/agent/stock/main.ts --once",
