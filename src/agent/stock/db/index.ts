@@ -14,6 +14,27 @@ export const STOCK_DB_PATH = join(MEMORY_DIR, "stock_agent.db");
 
 let _db: Database.Database | null = null;
 
+const QUOTE_OHLCV_COLUMNS: Array<[string, string]> = [
+  ["open_value", "REAL"],
+  ["high_value", "REAL"],
+  ["low_value", "REAL"],
+  ["volume", "REAL"], // 成交量（东方财富口径：手）
+  ["turnover", "REAL"], // 成交额（元）
+];
+
+function ensureColumn(db: Database.Database, table: string, col: string, def: string): void {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!rows.some((r) => r.name === col)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+  }
+}
+
+function applyMigrations(db: Database.Database): void {
+  for (const [col, def] of QUOTE_OHLCV_COLUMNS) {
+    ensureColumn(db, "index_quotes", col, def);
+  }
+}
+
 export function getDb(): Database.Database {
   if (_db) return _db;
   const db = new Database(STOCK_DB_PATH);
@@ -27,6 +48,11 @@ export function getDb(): Database.Database {
       index_name    TEXT    NOT NULL,
       trade_date    TEXT    NOT NULL,
       close_value   REAL    NOT NULL,
+      open_value    REAL,
+      high_value    REAL,
+      low_value     REAL,
+      volume        REAL,
+      turnover      REAL,
       change        REAL,
       change_pct    REAL,
       change_reason TEXT,
@@ -50,7 +76,93 @@ export function getDb(): Database.Database {
       UNIQUE(index_code, version)
     );
     CREATE INDEX IF NOT EXISTS idx_memory_code_version ON index_analysis_memory(index_code, version DESC);
+
+    -- ============ Phase 9 multi-signal: 4 张新表 ============
+
+    CREATE TABLE IF NOT EXISTS margin_balance (
+      trade_date       TEXT PRIMARY KEY,
+      finance_balance  REAL,
+      finance_buy      REAL,
+      finance_repay    REAL,
+      finance_net      REAL,
+      finance_net_3d   REAL,
+      finance_net_5d   REAL,
+      short_balance    REAL,
+      short_net        REAL,
+      total_balance    REAL,
+      market_index     REAL,
+      raw_json         TEXT,
+      created_at       TEXT NOT NULL,
+      updated_at       TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_margin_date ON margin_balance(trade_date DESC);
+
+    CREATE TABLE IF NOT EXISTS market_breadth (
+      trade_date  TEXT NOT NULL,
+      scope       TEXT NOT NULL,
+      advancing   INTEGER,
+      declining   INTEGER,
+      unchanged   INTEGER,
+      limit_up    INTEGER,
+      limit_down  INTEGER,
+      raw_json    TEXT,
+      created_at  TEXT NOT NULL,
+      updated_at  TEXT NOT NULL,
+      PRIMARY KEY (trade_date, scope)
+    );
+    CREATE INDEX IF NOT EXISTS idx_breadth_date ON market_breadth(trade_date DESC);
+
+    CREATE TABLE IF NOT EXISTS sector_quote (
+      trade_date    TEXT NOT NULL,
+      sector_code   TEXT NOT NULL,
+      sector_name   TEXT NOT NULL,
+      change_pct    REAL,
+      total_value   REAL,
+      total_amount  REAL,
+      turnover_pct  REAL,
+      rank_type     TEXT NOT NULL,
+      rank_pos      INTEGER NOT NULL,
+      created_at    TEXT NOT NULL,
+      PRIMARY KEY (trade_date, sector_code, rank_type)
+    );
+    CREATE INDEX IF NOT EXISTS idx_sector_date ON sector_quote(trade_date DESC, rank_type, rank_pos);
+
+    CREATE TABLE IF NOT EXISTS lhb_record (
+      trade_date     TEXT NOT NULL,
+      security_code  TEXT NOT NULL,
+      security_name  TEXT,
+      close_price    REAL,
+      change_rate    REAL,
+      net_amount     REAL,
+      buy_amount     REAL,
+      sell_amount    REAL,
+      market         TEXT,
+      explanation    TEXT,
+      raw_json       TEXT,
+      created_at     TEXT NOT NULL,
+      PRIMARY KEY (trade_date, security_code)
+    );
+    CREATE INDEX IF NOT EXISTS idx_lhb_date ON lhb_record(trade_date DESC);
+
+    CREATE TABLE IF NOT EXISTS news_event (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      as_of_date      TEXT NOT NULL,
+      source          TEXT,
+      url             TEXT,
+      title           TEXT NOT NULL,
+      summary         TEXT,
+      category        TEXT,
+      sentiment       REAL,
+      impact_indices  TEXT,
+      rationale       TEXT,
+      created_at      TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_news_event_date ON news_event(as_of_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_news_event_dedup ON news_event(as_of_date, title);
   `);
+
+  // 给已经存在的 index_quotes 表补齐 OHLCV 列（向前迁移，幂等）
+  applyMigrations(db);
 
   _db = db;
   return db;
@@ -64,6 +176,11 @@ export interface IndexQuoteRow {
   index_name: string;
   trade_date: string;
   close_value: number;
+  open_value?: number | null;
+  high_value?: number | null;
+  low_value?: number | null;
+  volume?: number | null;
+  turnover?: number | null;
   change: number | null;
   change_pct: number | null;
   change_reason?: string | null;
@@ -76,13 +193,21 @@ export function upsertQuote(row: IndexQuoteRow): void {
   const db = getDb();
   const now = new Date().toISOString();
   const existing = db
-    .prepare("SELECT id, change_reason, reason_source FROM index_quotes WHERE index_code = ? AND trade_date = ?")
-    .get(row.index_code, row.trade_date) as { id: number; change_reason: string | null; reason_source: string | null } | undefined;
+    .prepare("SELECT id FROM index_quotes WHERE index_code = ? AND trade_date = ?")
+    .get(row.index_code, row.trade_date) as { id: number } | undefined;
 
   if (existing) {
     db.prepare(
       `UPDATE index_quotes
-       SET index_name = ?, close_value = ?, change = ?, change_pct = ?,
+       SET index_name = ?,
+           close_value = ?,
+           open_value  = COALESCE(?, open_value),
+           high_value  = COALESCE(?, high_value),
+           low_value   = COALESCE(?, low_value),
+           volume      = COALESCE(?, volume),
+           turnover    = COALESCE(?, turnover),
+           change      = ?,
+           change_pct  = ?,
            change_reason = COALESCE(?, change_reason),
            reason_source = COALESCE(?, reason_source),
            updated_at = ?
@@ -90,6 +215,11 @@ export function upsertQuote(row: IndexQuoteRow): void {
     ).run(
       row.index_name,
       row.close_value,
+      row.open_value ?? null,
+      row.high_value ?? null,
+      row.low_value ?? null,
+      row.volume ?? null,
+      row.turnover ?? null,
       row.change,
       row.change_pct,
       row.change_reason ?? null,
@@ -102,13 +232,20 @@ export function upsertQuote(row: IndexQuoteRow): void {
 
   db.prepare(
     `INSERT INTO index_quotes
-     (index_code, index_name, trade_date, close_value, change, change_pct, change_reason, reason_source, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     (index_code, index_name, trade_date, close_value,
+      open_value, high_value, low_value, volume, turnover,
+      change, change_pct, change_reason, reason_source, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     row.index_code,
     row.index_name,
     row.trade_date,
     row.close_value,
+    row.open_value ?? null,
+    row.high_value ?? null,
+    row.low_value ?? null,
+    row.volume ?? null,
+    row.turnover ?? null,
     row.change,
     row.change_pct,
     row.change_reason ?? null,
@@ -239,6 +376,329 @@ export function appendMemory(
   };
 }
 
+// ==================== Phase 9 multi-signal: 类型 + CRUD ====================
+
+export interface MarginBalanceRow {
+  trade_date: string;
+  finance_balance: number | null;
+  finance_buy: number | null;
+  finance_repay: number | null;
+  finance_net: number | null;
+  finance_net_3d: number | null;
+  finance_net_5d: number | null;
+  short_balance: number | null;
+  short_net: number | null;
+  total_balance: number | null;
+  market_index: number | null;
+  raw_json?: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export function upsertMargin(row: MarginBalanceRow): void {
+  const db = getDb();
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO margin_balance
+     (trade_date, finance_balance, finance_buy, finance_repay, finance_net,
+      finance_net_3d, finance_net_5d, short_balance, short_net, total_balance,
+      market_index, raw_json, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(trade_date) DO UPDATE SET
+       finance_balance=excluded.finance_balance,
+       finance_buy=excluded.finance_buy,
+       finance_repay=excluded.finance_repay,
+       finance_net=excluded.finance_net,
+       finance_net_3d=excluded.finance_net_3d,
+       finance_net_5d=excluded.finance_net_5d,
+       short_balance=excluded.short_balance,
+       short_net=excluded.short_net,
+       total_balance=excluded.total_balance,
+       market_index=excluded.market_index,
+       raw_json=COALESCE(excluded.raw_json, margin_balance.raw_json),
+       updated_at=excluded.updated_at`
+  ).run(
+    row.trade_date,
+    row.finance_balance,
+    row.finance_buy,
+    row.finance_repay,
+    row.finance_net,
+    row.finance_net_3d,
+    row.finance_net_5d,
+    row.short_balance,
+    row.short_net,
+    row.total_balance,
+    row.market_index,
+    row.raw_json ?? null,
+    now,
+    now
+  );
+}
+
+export function getLatestMargin(): MarginBalanceRow | null {
+  const db = getDb();
+  return (
+    (db
+      .prepare("SELECT * FROM margin_balance ORDER BY trade_date DESC LIMIT 1")
+      .get() as MarginBalanceRow | undefined) ?? null
+  );
+}
+
+export function getMarginInRange(start: string, end: string): MarginBalanceRow[] {
+  const db = getDb();
+  return db
+    .prepare(
+      "SELECT * FROM margin_balance WHERE trade_date >= ? AND trade_date <= ? ORDER BY trade_date ASC"
+    )
+    .all(start, end) as MarginBalanceRow[];
+}
+
+export interface MarketBreadthRow {
+  trade_date: string;
+  scope: "sse" | "szse" | "chinext";
+  advancing: number | null;
+  declining: number | null;
+  unchanged: number | null;
+  limit_up: number | null;
+  limit_down: number | null;
+  raw_json?: string | null;
+}
+
+export function upsertBreadth(row: MarketBreadthRow): void {
+  const db = getDb();
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO market_breadth
+     (trade_date, scope, advancing, declining, unchanged, limit_up, limit_down, raw_json, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(trade_date, scope) DO UPDATE SET
+       advancing=excluded.advancing,
+       declining=excluded.declining,
+       unchanged=excluded.unchanged,
+       limit_up=COALESCE(excluded.limit_up, market_breadth.limit_up),
+       limit_down=COALESCE(excluded.limit_down, market_breadth.limit_down),
+       raw_json=COALESCE(excluded.raw_json, market_breadth.raw_json),
+       updated_at=excluded.updated_at`
+  ).run(
+    row.trade_date,
+    row.scope,
+    row.advancing,
+    row.declining,
+    row.unchanged,
+    row.limit_up,
+    row.limit_down,
+    row.raw_json ?? null,
+    now,
+    now
+  );
+}
+
+export function getBreadthInRange(
+  start: string,
+  end: string,
+  scope?: MarketBreadthRow["scope"]
+): MarketBreadthRow[] {
+  const db = getDb();
+  if (scope) {
+    return db
+      .prepare(
+        "SELECT * FROM market_breadth WHERE trade_date >= ? AND trade_date <= ? AND scope = ? ORDER BY trade_date ASC"
+      )
+      .all(start, end, scope) as MarketBreadthRow[];
+  }
+  return db
+    .prepare(
+      "SELECT * FROM market_breadth WHERE trade_date >= ? AND trade_date <= ? ORDER BY trade_date ASC, scope ASC"
+    )
+    .all(start, end) as MarketBreadthRow[];
+}
+
+export function getLatestBreadth(scope?: MarketBreadthRow["scope"]): MarketBreadthRow[] {
+  const db = getDb();
+  if (scope) {
+    const r = db
+      .prepare("SELECT * FROM market_breadth WHERE scope = ? ORDER BY trade_date DESC LIMIT 1")
+      .get(scope) as MarketBreadthRow | undefined;
+    return r ? [r] : [];
+  }
+  // 取最近一个 trade_date 的全部 3 个 scope
+  const latest = db
+    .prepare("SELECT trade_date FROM market_breadth ORDER BY trade_date DESC LIMIT 1")
+    .get() as { trade_date: string } | undefined;
+  if (!latest) return [];
+  return db
+    .prepare("SELECT * FROM market_breadth WHERE trade_date = ?")
+    .all(latest.trade_date) as MarketBreadthRow[];
+}
+
+export interface SectorQuoteRow {
+  trade_date: string;
+  sector_code: string;
+  sector_name: string;
+  change_pct: number | null;
+  total_value: number | null;
+  total_amount: number | null;
+  turnover_pct: number | null;
+  rank_type: "top5" | "bottom5";
+  rank_pos: number;
+}
+
+export function replaceSectorRotation(date: string, rows: SectorQuoteRow[]): void {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const tx = db.transaction((rs: SectorQuoteRow[]) => {
+    db.prepare("DELETE FROM sector_quote WHERE trade_date = ?").run(date);
+    const stmt = db.prepare(
+      `INSERT INTO sector_quote
+       (trade_date, sector_code, sector_name, change_pct, total_value,
+        total_amount, turnover_pct, rank_type, rank_pos, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`
+    );
+    for (const r of rs) {
+      stmt.run(
+        r.trade_date,
+        r.sector_code,
+        r.sector_name,
+        r.change_pct,
+        r.total_value,
+        r.total_amount,
+        r.turnover_pct,
+        r.rank_type,
+        r.rank_pos,
+        now
+      );
+    }
+  });
+  tx(rows);
+}
+
+export function getLatestSectorRotation(): SectorQuoteRow[] {
+  const db = getDb();
+  const latest = db
+    .prepare("SELECT trade_date FROM sector_quote ORDER BY trade_date DESC LIMIT 1")
+    .get() as { trade_date: string } | undefined;
+  if (!latest) return [];
+  return db
+    .prepare(
+      "SELECT * FROM sector_quote WHERE trade_date = ? ORDER BY rank_type ASC, rank_pos ASC"
+    )
+    .all(latest.trade_date) as SectorQuoteRow[];
+}
+
+export interface LhbRow {
+  trade_date: string;
+  security_code: string;
+  security_name: string | null;
+  close_price: number | null;
+  change_rate: number | null;
+  net_amount: number | null;
+  buy_amount: number | null;
+  sell_amount: number | null;
+  market: string | null;
+  explanation: string | null;
+  raw_json?: string | null;
+}
+
+export function upsertLhb(row: LhbRow): void {
+  const db = getDb();
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO lhb_record
+     (trade_date, security_code, security_name, close_price, change_rate,
+      net_amount, buy_amount, sell_amount, market, explanation, raw_json, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(trade_date, security_code) DO UPDATE SET
+       security_name=excluded.security_name,
+       close_price=excluded.close_price,
+       change_rate=excluded.change_rate,
+       net_amount=excluded.net_amount,
+       buy_amount=excluded.buy_amount,
+       sell_amount=excluded.sell_amount,
+       market=excluded.market,
+       explanation=excluded.explanation,
+       raw_json=COALESCE(excluded.raw_json, lhb_record.raw_json)`
+  ).run(
+    row.trade_date,
+    row.security_code,
+    row.security_name,
+    row.close_price,
+    row.change_rate,
+    row.net_amount,
+    row.buy_amount,
+    row.sell_amount,
+    row.market,
+    row.explanation,
+    row.raw_json ?? null,
+    now
+  );
+}
+
+export function getLhbByDate(date: string): LhbRow[] {
+  const db = getDb();
+  return db
+    .prepare("SELECT * FROM lhb_record WHERE trade_date = ? ORDER BY ABS(net_amount) DESC")
+    .all(date) as LhbRow[];
+}
+
+export function getLatestLhbDate(): string | null {
+  const db = getDb();
+  const r = db.prepare("SELECT trade_date FROM lhb_record ORDER BY trade_date DESC LIMIT 1").get() as
+    | { trade_date: string }
+    | undefined;
+  return r?.trade_date ?? null;
+}
+
+export interface NewsEventRow {
+  id?: number;
+  as_of_date: string;
+  source: string | null;
+  url: string | null;
+  title: string;
+  summary: string | null;
+  category: string | null;
+  sentiment: number | null;
+  impact_indices: string | null; // JSON array as string OR 'broad'
+  rationale: string | null;
+  created_at?: string;
+}
+
+export function insertNewsEventIfAbsent(row: NewsEventRow): boolean {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const exists = db
+    .prepare("SELECT id FROM news_event WHERE as_of_date = ? AND title = ? LIMIT 1")
+    .get(row.as_of_date, row.title) as { id: number } | undefined;
+  if (exists) return false;
+  db.prepare(
+    `INSERT INTO news_event
+     (as_of_date, source, url, title, summary, category, sentiment, impact_indices, rationale, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`
+  ).run(
+    row.as_of_date,
+    row.source,
+    row.url,
+    row.title,
+    row.summary,
+    row.category,
+    row.sentiment,
+    row.impact_indices,
+    row.rationale,
+    now
+  );
+  return true;
+}
+
+export function getNewsByDate(date: string, limit = 20): NewsEventRow[] {
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT * FROM news_event WHERE as_of_date = ?
+       ORDER BY ABS(COALESCE(sentiment, 0)) DESC, id ASC
+       LIMIT ?`
+    )
+    .all(date, limit) as NewsEventRow[];
+}
+
 // ==================== 测试辅助 ====================
 
 /** 仅用于测试：重新打开一个独立 DB 实例（不影响默认 _db）。*/
@@ -252,6 +712,11 @@ export function openDbForTest(path: string): Database.Database {
       index_name    TEXT    NOT NULL,
       trade_date    TEXT    NOT NULL,
       close_value   REAL    NOT NULL,
+      open_value    REAL,
+      high_value    REAL,
+      low_value     REAL,
+      volume        REAL,
+      turnover      REAL,
       change        REAL,
       change_pct    REAL,
       change_reason TEXT,
@@ -271,6 +736,52 @@ export function openDbForTest(path: string): Database.Database {
       created_at  TEXT    NOT NULL,
       updated_at  TEXT    NOT NULL,
       UNIQUE(index_code, version)
+    );
+
+    CREATE TABLE IF NOT EXISTS margin_balance (
+      trade_date       TEXT PRIMARY KEY,
+      finance_balance  REAL,
+      finance_buy      REAL,
+      finance_repay    REAL,
+      finance_net      REAL,
+      finance_net_3d   REAL,
+      finance_net_5d   REAL,
+      short_balance    REAL,
+      short_net        REAL,
+      total_balance    REAL,
+      market_index     REAL,
+      raw_json         TEXT,
+      created_at       TEXT NOT NULL,
+      updated_at       TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS market_breadth (
+      trade_date  TEXT NOT NULL,
+      scope       TEXT NOT NULL,
+      advancing   INTEGER, declining INTEGER, unchanged INTEGER,
+      limit_up    INTEGER, limit_down INTEGER,
+      raw_json    TEXT,
+      created_at  TEXT NOT NULL, updated_at TEXT NOT NULL,
+      PRIMARY KEY (trade_date, scope)
+    );
+    CREATE TABLE IF NOT EXISTS sector_quote (
+      trade_date    TEXT NOT NULL, sector_code TEXT NOT NULL, sector_name TEXT NOT NULL,
+      change_pct REAL, total_value REAL, total_amount REAL, turnover_pct REAL,
+      rank_type TEXT NOT NULL, rank_pos INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (trade_date, sector_code, rank_type)
+    );
+    CREATE TABLE IF NOT EXISTS lhb_record (
+      trade_date TEXT NOT NULL, security_code TEXT NOT NULL, security_name TEXT,
+      close_price REAL, change_rate REAL, net_amount REAL, buy_amount REAL, sell_amount REAL,
+      market TEXT, explanation TEXT, raw_json TEXT,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (trade_date, security_code)
+    );
+    CREATE TABLE IF NOT EXISTS news_event (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      as_of_date TEXT NOT NULL, source TEXT, url TEXT, title TEXT NOT NULL,
+      summary TEXT, category TEXT, sentiment REAL, impact_indices TEXT, rationale TEXT,
+      created_at TEXT NOT NULL
     );
   `);
   return db;

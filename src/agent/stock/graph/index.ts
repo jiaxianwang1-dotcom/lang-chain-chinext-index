@@ -13,6 +13,11 @@ import { ToolNode } from "@langchain/langgraph/prebuilt";
 
 import { defaultProvider } from "../providers/index.js";
 import { backfillOneYear, ingestToday } from "../providers/ingestion.js";
+import { ingestLatestMargin } from "../providers/margin.js";
+import { ingestMarketBreadth } from "../providers/breadth.js";
+import { ingestSectorRotation } from "../providers/sector.js";
+import { ingestLhb } from "../providers/lhb.js";
+import { classifyTodayNews } from "../news/index.js";
 import { analyzeChangeReason, backfillReasons } from "../analysis/index.js";
 import {
   bootstrapPredictionMemory,
@@ -188,16 +193,50 @@ export interface RunOnceOptions {
   notifier?: SmsNotifier;
 }
 
+/**
+ * 安全包装：把任一外部数据源失败转成日志，不阻塞 runOnce 主流程。
+ * 这是多信号架构的核心 fail-safe 约束。
+ */
+async function safeStep<T>(label: string, fn: () => Promise<T>): Promise<T | null> {
+  try {
+    return await fn();
+  } catch (e) {
+    logStage({
+      stage: `runOnce.${label}_failed`,
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return null;
+  }
+}
+
 export async function runOnce(opts: RunOnceOptions = {}): Promise<void> {
-  const ingested = await timed("ingest", undefined, () => ingestToday(defaultProvider));
+  // 1) 主行情入库（必需，失败即跳过非交易日）
+  const ingested = await timed("ingest_quote", undefined, () => ingestToday(defaultProvider));
   if (ingested.length === 0) {
     logStage({ stage: "runOnce.skip_non_trading", ok: true });
     return;
   }
+  const tradeDate = ingested[0].trade_date;
+
+  // 2) 各指数原因分析（保留原行为）
   for (const row of ingested) {
-    await timed("analyze", row.index_code, () => analyzeChangeReason(row.index_code, row.trade_date));
+    await safeStep(`analyze_${row.index_code}`, () =>
+      analyzeChangeReason(row.index_code, row.trade_date)
+    );
   }
+
+  // 3-7) 多维度数据采集，全部 fail-safe
+  await safeStep("ingest_margin", () => ingestLatestMargin());
+  await safeStep("ingest_breadth", () => ingestMarketBreadth(tradeDate));
+  await safeStep("ingest_sector", () => ingestSectorRotation(tradeDate));
+  await safeStep("ingest_lhb", () => ingestLhb(tradeDate));
+  await safeStep("classify_news", () => classifyTodayNews(tradeDate));
+
+  // 8) 预测（自动多信号）
   const predictions = await timed("predict", undefined, () => predictAllTargets());
+
+  // 9) 短信通知
   const notifier = opts.notifier ?? buildNotifier({ dryRun: opts.dryRun });
   await timed("notify", undefined, () => notifier.sendPredictionSms(predictions));
 }

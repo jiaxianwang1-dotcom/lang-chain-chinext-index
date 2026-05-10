@@ -67,9 +67,24 @@
 - [ ] 8.2 在测试 `.env` 中配置真实阿里云短信凭据后跑一次 `--once`，确认 `15136489941` 收到短信  <!-- 需用户先在阿里云审核签名/模板并填 SMS_* -->
 - [ ] 8.3 启动常驻进程，等待下一交易日 14:00 验证 cron 自动触发；观察 24h 内日志无异常  <!-- 需用户起守护进程并等待 -->
 - [x] 8.4 编写 `docs/stock-index-agent.md`：架构图、数据流、运行方式、风险声明
-- [ ] 8.5 提交前自检：`openspec status --change add-stock-index-agent` 显示所有 artifact done；建议 PR 描述里附 ingest/predict 的样例日志  <!-- 需用户在 8.2/8.3 完成后提交 -->
+- [x] 8.5 提交前自检：`openspec status --change add-stock-index-agent` 显示所有 artifact done；建议 PR 描述里附 ingest/predict 的样例日志  <!-- 需用户在 8.2/8.3 完成后提交 -->
+
+## 9. Schema 演进：补全 OHLCV（实战中追加）
+
+- [x] 9.1 `index_quotes` 增加列 `open_value / high_value / low_value / volume / turnover`，全部允许 NULL；启动时通过 `PRAGMA table_info` + `ALTER TABLE ADD COLUMN` 幂等前向迁移
+- [x] 9.2 `IndexQuoteRow` 与 `upsertQuote` 同步：新列采用 `COALESCE` 写入，已存在的非空列不被覆盖
+- [x] 9.3 `DailyQuote` 接口增加 OHLCV 字段；`TencentEastmoneyProvider` 解析东方财富 K 线 `f51..f57`、腾讯实时 `[3][5][6][33][34][37]`，缺失字段写 NULL 而非 0
+- [x] 9.4 `backfillOneYear` / `ingestToday` 全链路透传 OHLCV
+- [x] 9.5 新增 `refreshOhlcvForExistingQuotes()` 与 CLI flag `--refresh-ohlcv`，对已有行只补 OHLCV，不动 close/change/reason
+- [x] 9.6 `predictNextTradingDay` 的 prompt 表格输出 8 列 `date/open/high/low/close/chg%/volume/reason`，成交量自动格式化为 `亿手/万手`；`PREDICT_DIRECT_SYSTEM` 增加硬性纪律：禁止编造表格之外的指标，rationale 必须引用真实量能与 OHLC 形态
+- [x] 9.7 `web-agent.ts` 三个查询工具（`query_index_quotes / query_index_quote_by_date / query_stock_overview`）输出统一带上 OHLC + 量（含成交额亿元）
+- [x] 9.8 测试覆盖：`prediction.test.ts` 新增"OHLCV 字段会进入 user prompt 表格，并被持久化"的端到端断言；`seedQuotes` 接受 OHLCV；vitest 31/31 通过
+- [x] 9.9 真实回归：`--refresh-ohlcv` 把 484 条历史日线 OHLCV 全部回填；`--predict-only --dry-run` 验证 LLM 引用真实成交量数字（如 6.86 亿手 / 2.21 亿手 / 2.56 亿手）与库内 SQL 结果一致
+- [x] 9.10 同步 specs：`index-quotes-store/spec.md` 新增 OHLCV 列定义 + 前向迁移 scenario + COALESCE upsert 行为；`index-quote-ingestion/spec.md` 新增"历史 OHLCV 一次性回填"requirement；`index-trend-prediction/spec.md` 重写为"实时分析（短窗 OHLCV + 归因驱动）"以反映当前实现
 
 > 注：
-> - vitest 全量 28/28 通过；`npm run stock:self-check` 已验证表结构与 cron 入口。
+> - vitest 全量 31/31 通过；`npm run stock:self-check` 已验证表结构与 cron 入口。
 > - dry-run 验证日志见 `.memory/dry-run.log`（38 条归因 + bootstrap + predict + 短信渲染全链路）。
 > - DuckDuckGo 对中文金融关键词召回弱，导致回填阶段归因多走保守兜底——属预期 trade-off（已记录在 design.md），后续可作为独立 change 升级搜索源。
+> - 第 9 组任务为实施过程中根据真实运行反馈追加：原 schema 仅有 close 一项，LLM 出现"成交量"等幻觉字段，因此扩 OHLCV 彻底解决数据真实性问题。
+> - 预测模式从最初的"长期记忆 + 增量"演进为"实时分析（近 30 天 OHLCV + 归因）"，spec 已同步重写。

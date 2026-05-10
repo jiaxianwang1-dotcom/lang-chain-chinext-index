@@ -27,9 +27,16 @@ import {
   getLatestQuote,
   getQuotesInRange,
   getLatestMemory,
+  getMarginInRange,
+  getLatestMargin,
+  getBreadthInRange,
+  getLatestBreadth,
+  getLatestSectorRotation,
+  getNewsByDate,
 } from "./src/agent/stock/db/index.js";
 import { listTargetIndexes, findIndexMeta } from "./src/agent/stock/providers/index.js";
 import { predictAllTargets, predictNextTradingDay } from "./src/agent/stock/prediction/index.js";
+import { getLhbActivity, getLhbForIndex } from "./src/agent/stock/providers/lhb.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -160,6 +167,14 @@ const webFetch = tool(
 
 // ==================== 指数数据查询工具（来自 stock_agent.db） ====================
 
+function formatVolumeLite(v: number | null | undefined): string {
+  if (v == null || !Number.isFinite(v)) return "-";
+  if (v >= 1e12) return (v / 1e12).toFixed(2) + "万亿手";
+  if (v >= 1e8) return (v / 1e8).toFixed(2) + "亿手";
+  if (v >= 1e4) return (v / 1e4).toFixed(2) + "万手";
+  return Math.round(v).toString() + "手";
+}
+
 function resolveIndexCode(input?: string): string | null {
   if (!input) return null;
   const v = input.trim();
@@ -209,7 +224,14 @@ const queryIndexQuotes = tool(
       for (const r of tail) {
         const pct = r.change_pct == null ? "-" : (r.change_pct >= 0 ? "+" : "") + r.change_pct.toFixed(2) + "%";
         const reason = (r.change_reason ?? "（无归因）").slice(0, 60);
-        out.push(`  ${r.trade_date} 收盘=${r.close_value.toFixed(2)} 涨跌=${pct}  原因=${reason}`);
+        const ohlc =
+          r.open_value != null && r.high_value != null && r.low_value != null
+            ? `开${r.open_value.toFixed(2)} 高${r.high_value.toFixed(2)} 低${r.low_value.toFixed(2)}`
+            : "OHLC=-";
+        const vol = formatVolumeLite(r.volume);
+        out.push(
+          `  ${r.trade_date} ${ohlc} 收${r.close_value.toFixed(2)} 涨跌${pct} 量${vol}  原因=${reason}`
+        );
       }
     }
     return out.join("\n");
@@ -235,9 +257,18 @@ const queryIndexQuoteByDate = tool(
     const meta = findIndexMeta(code);
     if (!row) return `【${meta?.index_name ?? code}】 ${date} 无记录（可能是非交易日或尚未入库）。`;
     const pct = row.change_pct == null ? "-" : (row.change_pct >= 0 ? "+" : "") + row.change_pct.toFixed(2) + "%";
+    const ohlcLine =
+      row.open_value != null && row.high_value != null && row.low_value != null
+        ? `  开盘=${row.open_value.toFixed(2)}, 最高=${row.high_value.toFixed(2)}, 最低=${row.low_value.toFixed(2)}`
+        : `  OHLC: 缺失`;
+    const volLine = `  成交量=${formatVolumeLite(row.volume)}${
+      row.turnover != null ? `, 成交额=${(row.turnover / 1e8).toFixed(2)}亿元` : ""
+    }`;
     return [
       `【${meta?.index_name ?? code}】 ${date}`,
+      ohlcLine,
       `  收盘=${row.close_value.toFixed(2)}, 涨跌=${pct}`,
+      volLine,
       `  原因: ${row.change_reason ?? "（无归因）"}`,
       `  来源: ${row.reason_source ?? "（无来源）"}`,
     ].join("\n");
@@ -362,6 +393,195 @@ const runPredictionNow = tool(
   }
 );
 
+// ==================== 多信号查询工具（资金面 / 广度 / 板块 / 龙虎榜 / 事件）====================
+
+const queryMarginBalance = tool(
+  ({ days = 7 }: { days?: number }) => {
+    const latest = getLatestMargin();
+    if (!latest) return "[两融余额] 无数据。请先跑 backfill_margin。";
+    const start = (() => {
+      const d = new Date(latest.trade_date);
+      d.setUTCDate(d.getUTCDate() - Math.ceil(days * 1.6));
+      return d.toISOString().slice(0, 10);
+    })();
+    const rows = getMarginInRange(start, latest.trade_date).slice(-days);
+    const lines = [`[两融余额最近 ${rows.length} 个交易日（截至 ${latest.trade_date}，T+1 滞后）]`];
+    lines.push(`date\t融资余额(亿)\t融资净买入(亿)\t融券余额(亿)\t两融总额(亿)`);
+    for (const r of rows) {
+      lines.push(
+        [
+          r.trade_date,
+          r.finance_balance != null ? (r.finance_balance / 1e8).toFixed(0) : "-",
+          r.finance_net != null ? (r.finance_net >= 0 ? "+" : "") + (r.finance_net / 1e8).toFixed(2) : "-",
+          r.short_balance != null ? (r.short_balance / 1e8).toFixed(0) : "-",
+          r.total_balance != null ? (r.total_balance / 1e8).toFixed(0) : "-",
+        ].join("\t")
+      );
+    }
+    const sumNet = rows.reduce((a, r) => a + (r.finance_net ?? 0), 0);
+    lines.push(`累计融资净买入: ${sumNet >= 0 ? "+" : ""}${(sumNet / 1e8).toFixed(2)}亿`);
+    return lines.join("\n");
+  },
+  {
+    name: "query_margin_balance",
+    description:
+      "查询融资融券余额近 N 个交易日（默认 7）。返回融资余额、融资净买入、融券余额。用户问'最近两融加仓还是减仓''融资资金流入流出'时调用。数据 T+1 滞后属正常监管口径。",
+    schema: z.object({ days: z.number().optional().describe("最近多少个交易日，默认 7") }),
+  }
+);
+
+const queryMarketBreadth = tool(
+  ({ days = 5 }: { days?: number }) => {
+    const latest = getLatestBreadth();
+    if (latest.length === 0) return "[市场广度] 无数据。请先跑 ingest_breadth。";
+    const tradeDate = latest[0].trade_date;
+    const start = (() => {
+      const d = new Date(tradeDate);
+      d.setUTCDate(d.getUTCDate() - Math.ceil(days * 1.6));
+      return d.toISOString().slice(0, 10);
+    })();
+    const rows = getBreadthInRange(start, tradeDate);
+    const byDate = new Map<string, typeof rows>();
+    for (const r of rows) {
+      const arr = byDate.get(r.trade_date) ?? [];
+      arr.push(r);
+      byDate.set(r.trade_date, arr);
+    }
+    const dates = [...byDate.keys()].sort().slice(-days);
+    const lines = [`[市场广度最近 ${dates.length} 个交易日]`];
+    lines.push(`date\t上证(涨/跌/平/涨停)\t深证(涨/跌/平/涨停)\t创业板(涨/跌/平/涨停)`);
+    for (const d of dates) {
+      const groups = byDate.get(d) ?? [];
+      const fmt = (s: string) => {
+        const x = groups.find((g) => g.scope === s);
+        if (!x) return "-";
+        return `${x.advancing ?? "-"}/${x.declining ?? "-"}/${x.unchanged ?? "-"}/${x.limit_up ?? "-"}`;
+      };
+      lines.push(`${d}\t${fmt("sse")}\t${fmt("szse")}\t${fmt("chinext")}`);
+    }
+    return lines.join("\n");
+  },
+  {
+    name: "query_market_breadth",
+    description:
+      "查询沪/深/创三市最近 N 个交易日的涨跌平家数 + 涨停数（默认 5）。用户问'今天涨家多还是跌家多''市场情绪/赚钱效应'时调用。",
+    schema: z.object({ days: z.number().optional().describe("最近多少个交易日，默认 5") }),
+  }
+);
+
+const querySectorRotation = tool(
+  () => {
+    const rows = getLatestSectorRotation();
+    if (rows.length === 0) return "[板块轮动] 无数据。请先跑 ingest_sector。";
+    const top = rows.filter((r) => r.rank_type === "top5").sort((a, b) => a.rank_pos - b.rank_pos);
+    const bot = rows
+      .filter((r) => r.rank_type === "bottom5")
+      .sort((a, b) => a.rank_pos - b.rank_pos);
+    const lines = [`[当日板块轮动 ${rows[0].trade_date}]`];
+    lines.push("涨幅 Top5:");
+    for (const r of top) {
+      lines.push(
+        `  ${r.rank_pos}. ${r.sector_name} (${r.sector_code}) +${r.change_pct?.toFixed(2)}% 换手 ${r.turnover_pct?.toFixed(2)}%`
+      );
+    }
+    lines.push("跌幅 Bottom5:");
+    for (const r of bot) {
+      lines.push(
+        `  ${r.rank_pos}. ${r.sector_name} (${r.sector_code}) ${r.change_pct?.toFixed(2)}% 换手 ${r.turnover_pct?.toFixed(2)}%`
+      );
+    }
+    return lines.join("\n");
+  },
+  {
+    name: "query_sector_rotation",
+    description:
+      "返回当日板块涨幅榜 Top5 + 跌幅榜 Bottom5（含板块名、代码、涨跌幅、换手）。用户问'今天什么板块在动''今天涨什么''今天跌什么'时调用。",
+    schema: z.object({}),
+  }
+);
+
+const queryLhbToday = tool(
+  ({ index_code }: { index_code?: string }) => {
+    if (index_code) {
+      const meta = findIndexMeta(index_code);
+      if (!meta) return `未知指数 ${index_code}`;
+      const latest = getLatestQuote(index_code);
+      if (!latest) return "[龙虎榜] 该指数无行情数据";
+      const r = getLhbForIndex(latest.trade_date, index_code);
+      if (r.count === 0) return `[${meta.index_name}] ${latest.trade_date} 无成分股上榜`;
+      const sign = r.net_amount_sum >= 0 ? "+" : "";
+      const lines = [
+        `[${meta.index_name} ${latest.trade_date} 龙虎榜成分股 ${r.count} 只，净买入合计 ${sign}${(r.net_amount_sum / 1e8).toFixed(2)}亿]`,
+      ];
+      for (const t of r.top_3) {
+        lines.push(
+          `  ${t.code} ${t.name}  净额 ${t.net_amount >= 0 ? "+" : ""}${(t.net_amount / 1e8).toFixed(2)}亿  原因: ${(t.explanation ?? "").slice(0, 50)}`
+        );
+      }
+      return lines.join("\n");
+    }
+    // 全市场
+    const latest = getLatestQuote("000001.SH");
+    const date = latest?.trade_date ?? new Date().toISOString().slice(0, 10);
+    const a = getLhbActivity(date);
+    if (a.total_count === 0) return `[${date}] 龙虎榜无数据`;
+    const lines = [
+      `[全市场 ${date} 龙虎榜 ${a.total_count} 只上榜，净买入合计 +${(a.net_buy_total / 1e8).toFixed(2)}亿，净卖出合计 ${(a.net_sell_total / 1e8).toFixed(2)}亿]`,
+      `Top 3 (按 |净买入|):`,
+    ];
+    for (const t of a.top_3_by_net_amount) {
+      lines.push(
+        `  ${t.code} ${t.name}  净额 ${t.net_amount >= 0 ? "+" : ""}${(t.net_amount / 1e8).toFixed(2)}亿  原因: ${(t.explanation ?? "").slice(0, 50)}`
+      );
+    }
+    return lines.join("\n");
+  },
+  {
+    name: "query_lhb_today",
+    description:
+      "返回当日龙虎榜个股聚合：上榜只数、净买入合计、Top 3 个股净额与上榜原因。可指定 index_code 仅看影响该指数的成分股。用户问'今天龙虎榜机构看上谁''今天谁上龙虎榜'时调用。",
+    schema: z.object({
+      index_code: z
+        .string()
+        .optional()
+        .describe("可选 000001.SH / 399006.SZ / 399001.SZ；不传则全市场"),
+    }),
+  }
+);
+
+const queryTodayEvents = tool(
+  ({ as_of_date }: { as_of_date?: string }) => {
+    const date = as_of_date ?? getLatestQuote("000001.SH")?.trade_date ?? new Date().toISOString().slice(0, 10);
+    const events = getNewsByDate(date, 30);
+    if (events.length === 0) return `[${date}] 当日无已分类新闻事件。可调用 web_search 临时搜索。`;
+    const grouped = new Map<string, typeof events>();
+    for (const e of events) {
+      const k = e.category ?? "other";
+      const arr = grouped.get(k) ?? [];
+      arr.push(e);
+      grouped.set(k, arr);
+    }
+    const lines = [`[${date} 当日已分类事件 ${events.length} 条]`];
+    for (const [cat, evs] of grouped) {
+      lines.push(`\n# ${cat} (${evs.length})`);
+      for (const e of evs) {
+        const s = e.sentiment != null ? (e.sentiment >= 0 ? "+" : "") + e.sentiment.toFixed(2) : "0";
+        lines.push(`  [${s} ${e.impact_indices ?? "-"}] ${e.title}`);
+        if (e.rationale) lines.push(`     ↳ ${e.rationale}`);
+      }
+    }
+    return lines.join("\n");
+  },
+  {
+    name: "query_today_events",
+    description:
+      "返回某一交易日已分类的财经事件（按类别分组）。每条带 category / sentiment / impact_indices / rationale。用户问'今天有什么大新闻''今天 A 股有什么消息面'时调用。",
+    schema: z.object({
+      as_of_date: z.string().optional().describe("YYYY-MM-DD，默认当日"),
+    }),
+  }
+);
+
 const queryStockOverview = tool(
   () => {
     const out: string[] = ["[指数智能体数据概览]"];
@@ -371,7 +591,13 @@ const queryStockOverview = tool(
       out.push(`- ${meta.index_name} (${meta.index_code})`);
       if (latest) {
         const pct = latest.change_pct == null ? "-" : (latest.change_pct >= 0 ? "+" : "") + latest.change_pct.toFixed(2) + "%";
-        out.push(`    最新行情: ${latest.trade_date} 收盘=${latest.close_value.toFixed(2)} 涨跌=${pct}`);
+        const ohlc =
+          latest.open_value != null && latest.high_value != null && latest.low_value != null
+            ? ` 开${latest.open_value.toFixed(2)}/高${latest.high_value.toFixed(2)}/低${latest.low_value.toFixed(2)}`
+            : "";
+        out.push(
+          `    最新行情: ${latest.trade_date}${ohlc} 收=${latest.close_value.toFixed(2)} 涨跌=${pct} 量=${formatVolumeLite(latest.volume)}`
+        );
       } else {
         out.push(`    最新行情: 无`);
       }
@@ -467,6 +693,11 @@ const allTools = [
   queryLatestPrediction,
   runPredictionNow,
   queryStockOverview,
+  queryMarginBalance,
+  queryMarketBreadth,
+  querySectorRotation,
+  queryLhbToday,
+  queryTodayEvents,
 ];
 const llmWithTools = llm.bindTools(allTools);
 
@@ -479,12 +710,23 @@ const SYSTEM_PROMPT = `你是一个全能智能助手，具备以下能力：
 2. **联网搜索**: 可以搜索互联网获取最新信息
    - 使用 web_search 搜索实时信息
    - 使用 web_fetch 获取网页详细内容
-3. **指数行情数据库**: 你接管了 stock-index-agent 智能体生成的数据，可以回答上证指数和创业板指的历史行情、每日涨跌原因、长期分析记忆与下一交易日预测
-   - 用户问"最近行情/这周走势/某天为什么涨跌" → 调用 query_index_quotes 或 query_index_quote_by_date
-   - 用户问"下一交易日怎么走/买涨还是买跌/你的预测" → **必须先调用 query_latest_prediction**；如果它提示"无方向/无记忆"，再调用 run_prediction_now 触发新一次预测
-   - 用户问"你对趋势的判断/分析记忆/summary" → 调用 query_index_memory
-   - 用户问"有哪些数据/数据现状" → 调用 query_stock_overview
-   - 别名识别：上证指数=000001.SH（也叫沪指/大盘）；创业板指=399006.SZ（也叫创指）
+3. **指数行情数据库（多信号）**: 你接管了 stock-index-agent 智能体生成的数据，可以回答上证指数和创业板指的历史行情、每日涨跌原因、长期分析记忆、下一交易日预测，以及 7 维度多信号数据。
+   ## 价格行情维度
+   - "最近行情/这周走势/某天为什么涨跌" → query_index_quotes / query_index_quote_by_date
+   - "下一交易日怎么走/买涨还是买跌/你的预测" → **先调用 query_latest_prediction**；提示"无方向/无记忆"时再 run_prediction_now
+   - "你对趋势的判断/分析记忆/summary" → query_index_memory
+   - "有哪些数据/数据现状" → query_stock_overview
+   ## 多信号维度
+   - **资金面**：用户问"两融/融资余额/资金流入流出/最近加仓还是减仓" → query_margin_balance（数据 T+1 滞后）
+   - **市场广度**：用户问"今天涨家多还是跌家多/市场情绪/赚钱效应/涨停数" → query_market_breadth
+   - **板块轮动**：用户问"今天什么板块在动/今天涨什么/今天跌什么/热点主题" → query_sector_rotation
+   - **龙虎榜异动**：用户问"今天龙虎榜机构看上谁/今天谁上龙虎榜/机构在出手谁" → query_lhb_today；可指定 index_code
+   - **当日事件**：用户问"今天有什么大新闻/A 股有什么消息面/政策面" → query_today_events
+   ## 别名
+   - 上证指数=000001.SH（也叫沪指/大盘）；创业板指=399006.SZ（也叫创指）
+   ## 注意
+   - 涉及 A 股的查询**优先用本地工具**而不是 web_search；web_search 只用于补充本地没有的实时新闻或政策原文。
+   - 北向资金（沪深港通）数据源已停止公布每日数据（港交所 2024-08 起），不要用 web_search 找"北向资金"，应直接告知用户该数据已无可靠来源。
 
 ## 工作流程
 1. 对话开始时，可调用 search_memory 了解用户背景

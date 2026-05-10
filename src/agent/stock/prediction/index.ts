@@ -6,10 +6,19 @@ import {
   getLatestMemory,
   getLatestQuote,
   getQuotesInRange,
+  getMarginInRange,
+  getBreadthInRange,
+  getLatestSectorRotation,
   type AnalysisMemoryRow,
   type IndexQuoteRow,
+  type MarginBalanceRow,
+  type MarketBreadthRow,
+  type SectorQuoteRow,
 } from "../db/index.js";
 import { findIndexMeta, listTargetIndexes } from "../providers/index.js";
+import { getLhbForIndex } from "../providers/lhb.js";
+import { computeAnomalySignals, type AnomalySignals } from "../signals/index.js";
+import { getTodayNewsEvents } from "../news/index.js";
 import { logStage } from "../utils/log.js";
 
 // ==================== Schemas ====================
@@ -27,7 +36,34 @@ const PredictionSchema = z.object({
   updated_memory: MemoryShapeSchema,
 });
 
+const DirectPredictionSchema = z.object({
+  direction: z.enum(["up", "down"]),
+  confidence: z.number().min(0).max(1),
+  rationale: z.string().min(1),
+});
+
+const SignalLeanEnum = z.enum(["up", "down", "neutral", "missing"]);
+
+const MultiSignalPredictionSchema = z.object({
+  direction: z.enum(["up", "down"]),
+  confidence: z.number().min(0).max(1),
+  rationale: z.string().min(1),
+  signals: z
+    .object({
+      trend: SignalLeanEnum.optional(),
+      volume: SignalLeanEnum.optional(),
+      fund_flow: SignalLeanEnum.optional(),
+      breadth: SignalLeanEnum.optional(),
+      sector: SignalLeanEnum.optional(),
+      lhb: SignalLeanEnum.optional(),
+      news: SignalLeanEnum.optional(),
+    })
+    .optional(),
+});
+
 export type Prediction = z.infer<typeof PredictionSchema>;
+export type DirectPrediction = z.infer<typeof DirectPredictionSchema>;
+export type MultiSignalPrediction = z.infer<typeof MultiSignalPredictionSchema>;
 
 export interface PredictionResult {
   index_code: string;
@@ -37,6 +73,10 @@ export interface PredictionResult {
   rationale: string;
   as_of_date: string;
   version: number;
+  /** 实际入 prompt 的维度数（满分 7） */
+  dimensions_used?: number;
+  /** 各维度倾向 */
+  signals?: Record<string, "up" | "down" | "neutral" | "missing">;
 }
 
 // ==================== LLM ====================
@@ -80,6 +120,83 @@ const PREDICT_SYSTEM = `你是 A 股大盘趋势预测助手。
 5) 严格输出 JSON：{"direction":"up","confidence":0.6,"rationale":"...","updated_memory":{"summary":"...","features":{...}}}。
 6) 不构成投资建议，但请基于数据给出结论，不要含糊。`;
 
+const PREDICT_DIRECT_SYSTEM = `你是 A 股大盘短线方向判断助手。
+输入：某只指数最近若干个交易日的真实日线，每行包含：
+date / open / high / low / close / chg% / volume / reason
+其中 volume 是当日成交量（已格式化为亿手/万手等）。reason 是当日盘后归因（可能为空或"无显著公开事件"）。
+
+任务：基于上述 OHLCV + 归因做"实时分析"（技术面 + 资金面），判断"下一交易日"是"买涨"还是"买跌"，并给出置信度。
+
+硬性纪律：
+- 你只能引用上面表格里**实际出现**的数字。表格里没有的字段（例如 MACD、北向资金、换手率），**禁止编造**。
+- 如果某行 volume 或 OHLC 是 "-"，说明该字段缺失，**不要假装它有值**。
+- 不要给"中立 / 震荡 / 看不清"的结论；direction 必须二选一。
+
+输出要求：
+1) direction: "up"=买涨 / "down"=买跌，**必须二选一**。
+2) confidence: 0~1 的小数。基于数据信号清晰度：
+   - 信号非常明确（连续 3+ 日同向放量、突破前高/前低并伴随放量、收盘穿越关键均线且量能配合）→ 0.75-0.92
+   - 中性偏向某方向（例如 K 线连阳但量能温和） → 0.6-0.75
+   - 数据混乱、量价背离不明显 → 0.5-0.6
+   **不要为了"显得谨慎"刻意压低**，也不要给 1.0。
+3) rationale: ≤ 220 字中文。**必须**引用：
+   (a) 最近 1-3 日的具体收盘点位与涨跌幅；
+   (b) 量能变化（用表格中的 volume 字段，例如"5/8 量能 4.07亿手 较 5/7 的 3.21亿手 放大约 27%"）；
+   (c) 至少一条来自 reason 列的真实事件，或一条来自 OHLC 的形态（如"5/9 高 4185 低 4150 收 4180，长下影"）。
+   禁止泛泛之词如"震荡上行""市场情绪改善"。
+4) 严格输出 JSON：{"direction":"up","confidence":0.78,"rationale":"..."}。不要 Markdown，不要解释字段。`;
+
+const PREDICT_MULTI_SIGNAL_SYSTEM = `你是 A 股大盘短线方向判断助手（多信号模式）。
+
+你将收到 **7 个维度**的真实数据用于分析"下一交易日"方向（"up"=买涨 / "down"=买跌）：
+
+【维度 1：价格趋势】近 30 日 OHLCV 明细 + 60/90 日统计摘要
+【维度 2：量能】当日量比、近 30 日均量、量价配合
+【维度 3：资金面】两融余额（融资净买入近 5 日序列，T-1 滞后）
+【维度 4：市场广度】沪深创三市当日 涨/跌/平 家数 + 涨停数
+【维度 5：行业轮动】当日涨幅榜板块 Top5 + 跌幅榜 Bottom5
+【维度 6：龙虎榜异动】当日影响该指数的成分股净买入合计 + Top 3 个股
+【维度 7：当日新闻事件】已经按 (category / sentiment / impact) 结构化分类的事件列表
+
+============ 硬性纪律（违反则视为不合格输出）============
+
+A. **禁止编造**：你只能引用上述 7 维数据中**实际出现的数字与文本**。如果某维度被标注 "<数据缺失>"，rationale 中 MUST NOT 编造该维度的数字。
+B. **direction 必须二选一**：不允许中立 / 震荡 / 看不清。
+C. **维度覆盖**：rationale ≤ 280 字，**至少引用 4 个不同维度**的具体证据，且每条证据必须包含具体数字或专有名词（例：板块名 / 股票名 / 事件标题片段）。
+D. **维度冲突时降低置信度**：当多个维度方向相反（例如价格上涨但融资资金净流出 + 当日新闻偏负面）时，confidence MUST 在 [0.55, 0.65]，且 rationale 必须明确指出"维度冲突"或"分歧"。
+E. **置信度梯度**：
+   - 多维度（≥ 4）一致同向 + 信号明确 → 0.75–0.92
+   - 多维度一致但信号温和 → 0.65–0.75
+   - 主导维度不足 / 冲突 → 0.55–0.65
+   - 数据混乱 / 缺维度 ≥ 3 → 0.50–0.60
+   不允许 0.95+ 极端值，也不允许刻意压低到 0.5 以下。
+
+============ "异动信号"专项提醒 ============
+
+- 量比 > 1.5 + 当日 |chg%| < 1.0 → "高量低波"，可能有人在静默吸筹/出货，需结合龙虎榜判断方向
+- 量比 > 1.5 + 大盘明显上行 → 放量上行，趋势加强信号
+- 量比 < 0.7 + 微跌 → 缩量调整，下跌动能不足
+- 龙虎榜净买入 > 50 亿（全市场成分） + 集中某板块 → 机构看好该板块，与维度 5 行业轮动交叉验证
+
+============ 输出格式（严格 JSON，不要 Markdown）============
+
+{
+  "direction": "up" | "down",
+  "confidence": 0.78,
+  "rationale": "≤280 字中文，必须引用 4+ 维度的具体数字/专名",
+  "signals": {
+    "trend":     "up"|"down"|"neutral"|"missing",
+    "volume":    "up"|"down"|"neutral"|"missing",
+    "fund_flow": "up"|"down"|"neutral"|"missing",
+    "breadth":   "up"|"down"|"neutral"|"missing",
+    "sector":    "up"|"down"|"neutral"|"missing",
+    "lhb":       "up"|"down"|"neutral"|"missing",
+    "news":      "up"|"down"|"neutral"|"missing"
+  }
+}
+
+signals 中每个维度必须真实反映你对该维度的判断；data 缺失时填 "missing"。`;
+
 // ==================== Helpers ====================
 
 function safeParseJson<T>(raw: string, schema: z.ZodSchema<T>, fallback: T): T {
@@ -100,17 +217,41 @@ function safeParseJson<T>(raw: string, schema: z.ZodSchema<T>, fallback: T): T {
   return fallback;
 }
 
+function fmtNum(v: number | null | undefined, digits = 2): string {
+  if (v == null || !Number.isFinite(v)) return "-";
+  return v.toFixed(digits);
+}
+
+/** 把成交量（手）转成易读单位：< 1 亿 显示原值；≥ 1 亿 显示 X.XX亿手；≥ 1 万亿 显示 X.XX万亿手 */
+function fmtVolume(v: number | null | undefined): string {
+  if (v == null || !Number.isFinite(v)) return "-";
+  if (v >= 1e12) return (v / 1e12).toFixed(2) + "万亿手";
+  if (v >= 1e8) return (v / 1e8).toFixed(2) + "亿手";
+  if (v >= 1e4) return (v / 1e4).toFixed(2) + "万手";
+  return Math.round(v).toString() + "手";
+}
+
 function formatQuotesAsTable(rows: IndexQuoteRow[], limit = 80): string {
   // 太长会撑爆 prompt，回填阶段限制行数（取最近若干日 + 关键节点）
   const tail = rows.slice(-limit);
-  return tail
-    .map(
-      (r) =>
-        `${r.trade_date}\tclose=${r.close_value}\tchange_pct=${
-          r.change_pct == null ? "-" : r.change_pct.toFixed(2) + "%"
-        }\treason=${(r.change_reason ?? "").slice(0, 80)}`
-    )
+  // 列：日期 | 开 | 高 | 低 | 收 | 涨跌% | 量 | 原因
+  const header = "date\topen\thigh\tlow\tclose\tchg%\tvolume\treason";
+  const body = tail
+    .map((r) => {
+      const reason = (r.change_reason ?? "").replace(/\s+/g, " ").slice(0, 70);
+      return [
+        r.trade_date,
+        fmtNum(r.open_value),
+        fmtNum(r.high_value),
+        fmtNum(r.low_value),
+        fmtNum(r.close_value),
+        r.change_pct == null ? "-" : (r.change_pct >= 0 ? "+" : "") + r.change_pct.toFixed(2) + "%",
+        fmtVolume(r.volume),
+        reason,
+      ].join("\t");
+    })
     .join("\n");
+  return `${header}\n${body}`;
 }
 
 // ==================== Bootstrap ====================
@@ -171,46 +312,308 @@ export async function bootstrapPredictionMemory(
   return memory;
 }
 
-// ==================== Predict next ====================
+// ==================== 多维度数据组装 ====================
 
-export async function predictNextTradingDay(
-  indexCode: string,
-  opts: PredictionOptions = {}
-): Promise<PredictionResult> {
+function daysBefore(date: string, n: number): string {
+  const d = new Date(date);
+  d.setUTCDate(d.getUTCDate() - n);
+  return d.toISOString().slice(0, 10);
+}
+
+function quantile(arr: number[], q: number): number | null {
+  if (arr.length === 0) return null;
+  const sorted = [...arr].sort((a, b) => a - b);
+  const pos = (sorted.length - 1) * q;
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  if (sorted[base + 1] !== undefined) {
+    return sorted[base] + rest * (sorted[base + 1] - sorted[base]);
+  }
+  return sorted[base];
+}
+
+function formatLongWindowSummary(rows: IndexQuoteRow[], windowName: string): string {
+  if (rows.length === 0) return `[${windowName}] <数据缺失>`;
+  const closes = rows.map((r) => r.close_value).filter((v) => v != null) as number[];
+  const vols = rows.map((r) => r.volume).filter((v) => v != null && v > 0) as number[];
+  const last = closes[closes.length - 1];
+  const first = closes[0];
+  const max = Math.max(...closes);
+  const min = Math.min(...closes);
+  const median = quantile(closes, 0.5);
+  const cumPct = first > 0 ? ((last - first) / first) * 100 : 0;
+  // 当前点位的分位数
+  const sortedClosesAsc = [...closes].sort((a, b) => a - b);
+  const rank = sortedClosesAsc.findIndex((v) => v >= last);
+  const percentile = rank < 0 ? 100 : (rank / sortedClosesAsc.length) * 100;
+  const meanVol = vols.length > 0 ? vols.reduce((a, b) => a + b, 0) / vols.length : null;
+
+  const parts = [
+    `[${windowName} ${rows[0].trade_date}~${rows[rows.length - 1].trade_date}, ${rows.length} 个交易日]`,
+    `close: max ${max.toFixed(2)} / min ${min.toFixed(2)} / median ${median?.toFixed(2)} / 当前 ${last.toFixed(2)}`,
+    `当前点位分位: ${percentile.toFixed(0)}%`,
+    `区间累计 ${cumPct >= 0 ? "+" : ""}${cumPct.toFixed(2)}%`,
+  ];
+  if (meanVol != null) {
+    parts.push(`均量: ${fmtVolume(meanVol)}`);
+  }
+  return parts.join(" | ");
+}
+
+function formatMargin5Day(margins: MarginBalanceRow[]): string {
+  if (margins.length === 0) return "<两融数据缺失>";
+  const lines = ["date\t融资余额(亿)\t融资净买入(亿)\t融券余额(亿)"];
+  for (const m of margins.slice(-5)) {
+    lines.push(
+      [
+        m.trade_date,
+        m.finance_balance != null ? (m.finance_balance / 1e8).toFixed(0) : "-",
+        m.finance_net != null ? (m.finance_net >= 0 ? "+" : "") + (m.finance_net / 1e8).toFixed(2) : "-",
+        m.short_balance != null ? (m.short_balance / 1e8).toFixed(0) : "-",
+      ].join("\t")
+    );
+  }
+  // 累计 5 日净买
+  const sumNet = margins
+    .slice(-5)
+    .map((m) => m.finance_net ?? 0)
+    .reduce((a, b) => a + b, 0);
+  lines.push(`近 5 日累计融资净买入: ${sumNet >= 0 ? "+" : ""}${(sumNet / 1e8).toFixed(2)}亿`);
+  return lines.join("\n");
+}
+
+function formatBreadth5Day(rows: MarketBreadthRow[]): string {
+  if (rows.length === 0) return "<广度数据缺失>";
+  // 按 trade_date 分组
+  const byDate = new Map<string, MarketBreadthRow[]>();
+  for (const r of rows) {
+    const arr = byDate.get(r.trade_date) ?? [];
+    arr.push(r);
+    byDate.set(r.trade_date, arr);
+  }
+  const dates = [...byDate.keys()].sort().slice(-5);
+  const lines = ["date\t上证(涨/跌/平/涨停)\t深证(涨/跌/平/涨停)\t创业板(涨/跌/平/涨停)"];
+  for (const d of dates) {
+    const groups = byDate.get(d) ?? [];
+    const fmt = (s: string) => {
+      const x = groups.find((g) => g.scope === s);
+      if (!x) return "-";
+      return `${x.advancing ?? "-"}/${x.declining ?? "-"}/${x.unchanged ?? "-"}/${x.limit_up ?? "-"}`;
+    };
+    lines.push(`${d}\t${fmt("sse")}\t${fmt("szse")}\t${fmt("chinext")}`);
+  }
+  return lines.join("\n");
+}
+
+function formatSectorTopBottom(rows: SectorQuoteRow[]): string {
+  if (rows.length === 0) return "<板块数据缺失>";
+  const top = rows.filter((r) => r.rank_type === "top5").sort((a, b) => a.rank_pos - b.rank_pos);
+  const bot = rows.filter((r) => r.rank_type === "bottom5").sort((a, b) => a.rank_pos - b.rank_pos);
+  const lines: string[] = [];
+  lines.push(
+    "涨幅 Top5: " +
+      top
+        .map((r) => `${r.sector_name}+${r.change_pct?.toFixed(2)}%`)
+        .join(" / ")
+  );
+  lines.push(
+    "跌幅 Bottom5: " +
+      bot
+        .map((r) => `${r.sector_name}${r.change_pct?.toFixed(2)}%`)
+        .join(" / ")
+  );
+  return lines.join("\n");
+}
+
+function formatLhbSummary(
+  date: string,
+  indexCode: string
+): string {
+  try {
+    const r = getLhbForIndex(date, indexCode);
+    if (r.count === 0) return "<当日无影响该指数的龙虎榜个股（或数据未到）>";
+    const sign = r.net_amount_sum >= 0 ? "+" : "";
+    const lines = [
+      `${date} 影响该指数的龙虎榜成分股: ${r.count} 只，净买入合计 ${sign}${(r.net_amount_sum / 1e8).toFixed(2)}亿`,
+    ];
+    for (const t of r.top_3) {
+      lines.push(
+        `  - ${t.code} ${t.name} 净额 ${t.net_amount >= 0 ? "+" : ""}${(t.net_amount / 1e8).toFixed(2)}亿  原因: ${(t.explanation ?? "").slice(0, 40)}`
+      );
+    }
+    return lines.join("\n");
+  } catch {
+    return "<龙虎榜数据缺失>";
+  }
+}
+
+function formatNewsToday(asOfDate: string): string {
+  const events = getTodayNewsEvents(asOfDate, 10);
+  if (events.length === 0) return "<当日无已分类新闻事件>";
+  const lines: string[] = [];
+  for (const e of events) {
+    const s = e.sentiment != null ? (e.sentiment >= 0 ? "+" : "") + e.sentiment.toFixed(2) : "0";
+    lines.push(`[${e.category} ${s} ${e.impact_indices ?? "-"}] ${e.title}`);
+    if (e.rationale) lines.push(`  ↳ ${e.rationale}`);
+  }
+  return lines.join("\n");
+}
+
+function formatAnomalyNotes(s: AnomalySignals): string {
+  return s.notes.map((n) => "  - " + n).join("\n");
+}
+
+interface MultiSignalContext {
+  indexCode: string;
+  indexName: string;
+  asOfDate: string;
+  windowDays: number;
+  recent30: IndexQuoteRow[];
+  earliest30: string;
+  margin30: MarginBalanceRow[];
+  breadth30: MarketBreadthRow[];
+  sector: SectorQuoteRow[];
+  signals: AnomalySignals;
+  dimensionsAvailable: number;
+}
+
+function gatherMultiSignalContext(indexCode: string, windowDays: number): MultiSignalContext {
   const meta = findIndexMeta(indexCode);
   if (!meta) throw new Error(`未知 index_code: ${indexCode}`);
-
-  let memory = getLatestMemory(indexCode);
-  if (!memory) {
-    memory = await bootstrapPredictionMemory(indexCode, opts);
-  }
-
   const latest = getLatestQuote(indexCode);
   if (!latest) throw new Error(`${indexCode} 无任何行情数据，无法预测`);
 
-  // 仅读取 memory.as_of_date 之后的新增日线（不含 as_of_date）
-  const newRows = getQuotesInRange(indexCode, memory.as_of_date, latest.trade_date).filter(
-    (r) => r.trade_date > memory!.as_of_date
+  const startNatural = daysBefore(latest.trade_date, Math.ceil(windowDays * 1.6));
+  const recent30 = getQuotesInRange(indexCode, startNatural, latest.trade_date).slice(-windowDays);
+  if (recent30.length === 0) throw new Error(`${indexCode} 区间内无行情数据，无法预测`);
+
+  const earliest30 = recent30[0].trade_date;
+
+  // 维度 3：两融（取 30 自然日范围）
+  const margin30 = getMarginInRange(daysBefore(latest.trade_date, 45), latest.trade_date);
+  // 维度 4：广度（取 7 自然日，确保拿到近 5 个交易日）
+  const breadth30 = getBreadthInRange(daysBefore(latest.trade_date, 10), latest.trade_date);
+  // 维度 5：板块（最近一日）
+  const sector = getLatestSectorRotation();
+  // 维度 7：异动（含 lhb_active）
+  const signals = computeAnomalySignals(indexCode);
+
+  // 计数：trend(总有) + volume(总有) + margin / breadth / sector / lhb / news
+  let dims = 2; // trend + volume
+  if (margin30.length > 0) dims += 1;
+  if (breadth30.length > 0) dims += 1;
+  if (sector.length > 0) dims += 1;
+  if (signals.lhb_active) dims += 1;
+  if (getTodayNewsEvents(latest.trade_date, 1).length > 0) dims += 1;
+
+  return {
+    indexCode,
+    indexName: meta.index_name,
+    asOfDate: latest.trade_date,
+    windowDays: recent30.length,
+    recent30,
+    earliest30,
+    margin30,
+    breadth30,
+    sector,
+    signals,
+    dimensionsAvailable: dims,
+  };
+}
+
+function buildMultiSignalUserPrompt(ctx: MultiSignalContext): string {
+  // 60/90 日摘要（如果数据够）
+  const longWindowStart60 = daysBefore(ctx.asOfDate, 90);
+  const longWindowStart90 = daysBefore(ctx.asOfDate, 130);
+  const win60 = getQuotesInRange(ctx.indexCode, longWindowStart60, ctx.asOfDate);
+  const win90 = getQuotesInRange(ctx.indexCode, longWindowStart90, ctx.asOfDate);
+
+  const sections: string[] = [];
+  sections.push(`========== 当前指数 ==========`);
+  sections.push(`${ctx.indexName} (${ctx.indexCode})  截至: ${ctx.asOfDate}`);
+  sections.push(`数据窗口: ${ctx.earliest30} ~ ${ctx.asOfDate}, 共 ${ctx.windowDays} 个交易日（详细明细）`);
+  sections.push("");
+
+  sections.push(`========== 维度 1：价格趋势（30 日明细 + 长窗摘要）==========`);
+  sections.push(formatQuotesAsTable(ctx.recent30, ctx.windowDays));
+  sections.push("");
+  sections.push(formatLongWindowSummary(win60, "近 60 日"));
+  sections.push(formatLongWindowSummary(win90, "近 90 日"));
+  sections.push("");
+
+  sections.push(`========== 维度 2/7：当日量能 + 异动信号 ==========`);
+  sections.push(formatAnomalyNotes(ctx.signals));
+  sections.push("");
+
+  sections.push(`========== 维度 3：资金面（两融余额，T-1 滞后）==========`);
+  sections.push(formatMargin5Day(ctx.margin30));
+  sections.push("");
+
+  sections.push(`========== 维度 4：市场广度（沪/深/创 涨跌平 + 涨停数）==========`);
+  sections.push(formatBreadth5Day(ctx.breadth30));
+  sections.push("");
+
+  sections.push(`========== 维度 5：行业轮动（当日板块涨跌榜）==========`);
+  sections.push(formatSectorTopBottom(ctx.sector));
+  sections.push("");
+
+  sections.push(`========== 维度 6：龙虎榜异动（影响该指数的成分股）==========`);
+  sections.push(formatLhbSummary(ctx.asOfDate, ctx.indexCode));
+  sections.push("");
+
+  sections.push(`========== 维度 7：当日已分类新闻事件 ==========`);
+  sections.push(formatNewsToday(ctx.asOfDate));
+  sections.push("");
+
+  sections.push(`========== 任务 ==========`);
+  sections.push(
+    `基于以上 7 维真实数据判断"下一交易日"方向（buy=up / buy=down）。`
+  );
+  sections.push(
+    `rationale 必须引用至少 4 个不同维度的具体数字/专名；维度冲突时降低 confidence；维度缺失（标注 <数据缺失>）的字段不准编造。`
+  );
+  sections.push(
+    `signals 字段每项必须诚实反映你对该维度的判断，缺失数据填 "missing"。`
   );
 
-  const userPrompt = [
-    `指数: ${meta.index_name} (${meta.index_code})`,
-    `当前长期记忆版本: v${memory.version} (as_of_date=${memory.as_of_date})`,
-    `--- 上一份长期记忆 ---`,
-    `summary: ${memory.summary}`,
-    `features: ${memory.features}`,
-    `--- 自 ${memory.as_of_date} 之后的新增日线 (${newRows.length} 条) ---`,
-    newRows.length ? formatQuotesAsTable(newRows, 200) : "（无新增数据，请基于上一份记忆与最新行情判断）",
-    `--- 最新一条行情 ---`,
-    `${latest.trade_date} close=${latest.close_value} change_pct=${
-      latest.change_pct == null ? "-" : latest.change_pct.toFixed(2) + "%"
-    } reason=${(latest.change_reason ?? "").slice(0, 200)}`,
-  ].join("\n");
+  return sections.join("\n");
+}
+
+// ==================== Predict next ====================
+
+export interface PredictNextOptions extends PredictionOptions {
+  /** 喂给模型的最近交易日条数，默认 30。*/
+  windowDays?: number;
+  /** 是否使用多信号模式（默认 true）。设 false 退回旧版单维度 prompt。 */
+  multiSignal?: boolean;
+}
+
+/**
+ * 多信号实时分析：在原 OHLCV + 归因基础上，额外整合两融 / 广度 / 板块 / 龙虎榜 /
+ * 当日新闻事件 / 异动信号共 7 个维度喂给 LLM。任一维度缺失都不阻塞，仅降级。
+ *
+ * 不读取 `index_analysis_memory` 中的旧记忆作为输入。
+ * 预测结果（含 signals / dimensions_used）写入 `index_analysis_memory.features.last_prediction`。
+ */
+export async function predictNextTradingDay(
+  indexCode: string,
+  opts: PredictNextOptions = {}
+): Promise<PredictionResult> {
+  const windowDays = opts.windowDays ?? 30;
+  const useMulti = opts.multiSignal !== false;
+
+  // === 旧版单维度路径（仅用于回归测试 / 显式降级）===
+  if (!useMulti) {
+    return predictDirectLegacy(indexCode, opts, windowDays);
+  }
+
+  const ctx = gatherMultiSignalContext(indexCode, windowDays);
+  const userPrompt = buildMultiSignalUserPrompt(ctx);
 
   const llmInvoke = opts.llmInvoke ?? defaultInvokeLlm;
   let raw = "";
   try {
-    raw = await llmInvoke(PREDICT_SYSTEM, userPrompt);
+    raw = await llmInvoke(PREDICT_MULTI_SIGNAL_SYSTEM, userPrompt);
   } catch (e) {
     logStage({
       stage: "predict.llm_failed",
@@ -220,46 +623,55 @@ export async function predictNextTradingDay(
     });
   }
 
-  const fallback: Prediction = {
-    direction: latest.change_pct != null && latest.change_pct >= 0 ? "up" : "down",
+  const fallback: MultiSignalPrediction = {
+    direction:
+      ctx.recent30[ctx.recent30.length - 1].change_pct != null &&
+      ctx.recent30[ctx.recent30.length - 1].change_pct! >= 0
+        ? "up"
+        : "down",
     confidence: 0.5,
     rationale: "（兜底）LLM 不可用或解析失败，按最近一日方向给出弱信号。",
-    updated_memory: {
-      summary: memory.summary,
-      features: { fallback: true, latest_close: latest.close_value, as_of: latest.trade_date },
+    signals: {
+      trend: "missing",
+      volume: "missing",
+      fund_flow: "missing",
+      breadth: "missing",
+      sector: "missing",
+      lhb: "missing",
+      news: "missing",
     },
   };
+  const parsed = raw ? safeParseJson(raw, MultiSignalPredictionSchema, fallback) : fallback;
 
-  const parsed = raw ? safeParseJson(raw, PredictionSchema, fallback) : fallback;
-
-  // 将本次预测结果（direction/confidence/rationale）随长期记忆一同持久化，
-  // 后续 `query_latest_prediction` 才能从 DB 中恢复出方向。
-  const enrichedFeatures: Record<string, unknown> = {
-    ...parsed.updated_memory.features,
+  const features: Record<string, unknown> = {
     last_prediction: {
       direction: parsed.direction,
       confidence: parsed.confidence,
       rationale: parsed.rationale,
-      based_on_trade_date: latest.trade_date,
+      signals: parsed.signals ?? {},
+      dimensions_used: ctx.dimensionsAvailable,
+      based_on_trade_date: ctx.asOfDate,
+      window_days: ctx.windowDays,
+      window_start: ctx.earliest30,
       predicted_at: new Date().toISOString(),
+      mode: "multi-signal-30d",
     },
   };
-
-  const newMemory = appendMemory(
-    indexCode,
-    latest.trade_date,
-    parsed.updated_memory.summary,
-    enrichedFeatures
-  );
+  const summaryBody = `基于 7 维多信号实时分析（${ctx.dimensionsAvailable}/7 维度齐备）：${
+    parsed.direction === "up" ? "买涨" : "买跌"
+  }（置信度 ${(parsed.confidence * 100).toFixed(1)}%）。${parsed.rationale}`;
+  const newMemory = appendMemory(indexCode, ctx.asOfDate, summaryBody, features);
 
   const result: PredictionResult = {
     index_code: indexCode,
-    index_name: meta.index_name,
+    index_name: ctx.indexName,
     direction: parsed.direction,
     confidence: parsed.confidence,
     rationale: parsed.rationale,
-    as_of_date: latest.trade_date,
+    as_of_date: ctx.asOfDate,
     version: newMemory.version,
+    dimensions_used: ctx.dimensionsAvailable,
+    signals: parsed.signals,
   };
   logStage({
     stage: "predict.done",
@@ -268,8 +680,89 @@ export async function predictNextTradingDay(
     direction: result.direction,
     confidence: result.confidence,
     version: result.version,
+    dimensions_used: ctx.dimensionsAvailable,
+    mode: "multi-signal-30d",
   });
   return result;
+}
+
+/** 旧版单维度预测，保留供降级与单元测试。 */
+async function predictDirectLegacy(
+  indexCode: string,
+  opts: PredictNextOptions,
+  windowDays: number
+): Promise<PredictionResult> {
+  const meta = findIndexMeta(indexCode);
+  if (!meta) throw new Error(`未知 index_code: ${indexCode}`);
+
+  const latest = getLatestQuote(indexCode);
+  if (!latest) throw new Error(`${indexCode} 无任何行情数据，无法预测`);
+
+  const startNatural = daysBefore(latest.trade_date, Math.ceil(windowDays * 1.6));
+  const recent = getQuotesInRange(indexCode, startNatural, latest.trade_date).slice(-windowDays);
+
+  if (recent.length === 0) {
+    throw new Error(`${indexCode} 区间内无行情数据，无法预测`);
+  }
+
+  const earliest = recent[0].trade_date;
+  const userPrompt = [
+    `指数: ${meta.index_name} (${meta.index_code})`,
+    `数据窗口: ${earliest} ~ ${latest.trade_date}, 共 ${recent.length} 个交易日`,
+    `近 ${recent.length} 日行情明细（列含义见 system prompt）：`,
+    formatQuotesAsTable(recent, windowDays),
+    ``,
+    `请基于上述真实 OHLCV + 归因做实时分析，判断下一交易日方向（买涨 / 买跌）。`,
+    `必须引用具体收盘点位、涨跌幅、以及表格里实际出现的成交量数字；不准编造表格里没有的指标。`,
+  ].join("\n");
+
+  const llmInvoke = opts.llmInvoke ?? defaultInvokeLlm;
+  let raw = "";
+  try {
+    raw = await llmInvoke(PREDICT_DIRECT_SYSTEM, userPrompt);
+  } catch (e) {
+    logStage({
+      stage: "predict.llm_failed",
+      indexCode,
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+
+  const fallback: DirectPrediction = {
+    direction: latest.change_pct != null && latest.change_pct >= 0 ? "up" : "down",
+    confidence: 0.5,
+    rationale: "（兜底）LLM 不可用或解析失败，按最近一日方向给出弱信号。",
+  };
+
+  const parsed = raw ? safeParseJson(raw, DirectPredictionSchema, fallback) : fallback;
+
+  const features: Record<string, unknown> = {
+    last_prediction: {
+      direction: parsed.direction,
+      confidence: parsed.confidence,
+      rationale: parsed.rationale,
+      based_on_trade_date: latest.trade_date,
+      window_days: recent.length,
+      window_start: earliest,
+      predicted_at: new Date().toISOString(),
+      mode: "direct-30d",
+    },
+  };
+  const summaryBody = `基于 ${earliest}~${latest.trade_date} 共 ${recent.length} 个交易日的实时分析：${
+    parsed.direction === "up" ? "买涨" : "买跌"
+  }（置信度 ${(parsed.confidence * 100).toFixed(1)}%）。${parsed.rationale}`;
+  const newMemory = appendMemory(indexCode, latest.trade_date, summaryBody, features);
+
+  return {
+    index_code: indexCode,
+    index_name: meta.index_name,
+    direction: parsed.direction,
+    confidence: parsed.confidence,
+    rationale: parsed.rationale,
+    as_of_date: latest.trade_date,
+    version: newMemory.version,
+  };
 }
 
 export async function predictAllTargets(opts: PredictionOptions = {}): Promise<PredictionResult[]> {

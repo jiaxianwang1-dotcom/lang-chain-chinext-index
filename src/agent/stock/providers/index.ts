@@ -5,6 +5,13 @@ export interface DailyQuote {
   index_name: string;
   trade_date: string; // YYYY-MM-DD
   close_value: number;
+  open_value?: number;
+  high_value?: number;
+  low_value?: number;
+  /** 成交量（东方财富口径：手；指数为成交手数总和） */
+  volume?: number;
+  /** 成交额（元） */
+  turnover?: number;
 }
 
 export interface QuoteProvider {
@@ -122,19 +129,35 @@ export class TencentEastmoneyProvider implements QuoteProvider {
     if (!match) return null;
     const fields = match[1].split("~");
     if (fields.length < 31) return null;
+    // 腾讯指数实时字段（经验值 / 公开接口约定）：
+    //   [3]=current(close), [4]=prev_close, [5]=open, [6]=volume(手),
+    //   [33]=high, [34]=low, [37]=turnover(万元), [30]=update_ts
     const close = parseFloat(fields[3]);
     if (!Number.isFinite(close) || close === 0) return null;
-    // fields[30] 类似 "20260509150000"
     const tradeDateRaw = fields[30] ?? "";
     const tradeDate =
       tradeDateRaw.length >= 8
         ? compactToDate(tradeDateRaw.slice(0, 8))
         : new Date().toISOString().slice(0, 10);
+    const safeNum = (v: string | undefined): number | undefined => {
+      if (!v) return undefined;
+      const n = parseFloat(v);
+      return Number.isFinite(n) ? n : undefined;
+    };
     return {
       index_code: meta.index_code,
       index_name: meta.index_name,
       trade_date: tradeDate,
       close_value: close,
+      open_value: safeNum(fields[5]),
+      high_value: safeNum(fields[33]),
+      low_value: safeNum(fields[34]),
+      volume: safeNum(fields[6]),
+      // 腾讯返回的是万元 → 转元；解析失败则忽略
+      turnover: (() => {
+        const v = safeNum(fields[37]);
+        return v == null ? undefined : v * 10000;
+      })(),
     };
   }
 
@@ -147,7 +170,8 @@ export class TencentEastmoneyProvider implements QuoteProvider {
       secid: meta.eastmoney_secid,
       ut: "fa5fd1943c7b386f172d6893dbfba10b",
       fields1: "f1,f2,f3,f4,f5",
-      fields2: "f51,f52,f53,f54,f55,f56,f57,f58", // f51=date, f52=open, f53=close
+      // f51=date f52=open f53=close f54=high f55=low f56=volume(手) f57=turnover(元) f58=amplitude
+      fields2: "f51,f52,f53,f54,f55,f56,f57,f58",
       klt: "101", // 日线
       fqt: "0",
       beg: dateToCompact(startDate),
@@ -163,17 +187,29 @@ export class TencentEastmoneyProvider implements QuoteProvider {
     const klines = json.data?.klines ?? [];
     const out: DailyQuote[] = [];
     for (const line of klines) {
-      // "2026-05-09,3500.00,3510.00,3515.00,3490.00,..."
+      // "2026-05-09,open,close,high,low,volume,turnover,amplitude,..."
       const parts = line.split(",");
       if (parts.length < 3) continue;
       const tradeDate = parts[0];
       const close = parseFloat(parts[2]);
       if (!tradeDate || !Number.isFinite(close)) continue;
+
+      const safeNum = (idx: number): number | undefined => {
+        const v = parts[idx];
+        if (v == null || v === "") return undefined;
+        const n = parseFloat(v);
+        return Number.isFinite(n) ? n : undefined;
+      };
       out.push({
         index_code: meta.index_code,
         index_name: meta.index_name,
         trade_date: tradeDate,
         close_value: close,
+        open_value: safeNum(1),
+        high_value: safeNum(3),
+        low_value: safeNum(4),
+        volume: safeNum(5),
+        turnover: safeNum(6),
       });
     }
     return out;

@@ -10,15 +10,24 @@
 ### Requirement: 首次回填近 1 年日线
 系统 SHALL 在首次启动（或显式触发回填命令）时，从行情数据源拉取每个目标指数最近 365 个自然日内的全部交易日日线数据，计算每条记录的 `change` 与 `change_pct`，并通过 upsert 方式写入 `index_quotes`。
 
+每条入库记录 MUST 同时尽力填充 OHLCV 字段（`open_value / high_value / low_value / volume / turnover`）；当行情源返回该字段缺失时 MAY 写入 NULL，但不得用 0 占位。
+
 回填过程 MUST 跳过非交易日，并在网络/数据源失败时记录错误且继续处理其他日期，整体作业以"已成功回填 N 条 / 失败 M 条"汇总日志结束。
 
 #### Scenario: 数据库为空时执行全量回填
 - **WHEN** `index_quotes` 表中目标指数无任何记录，且执行 `backfillOneYear()`
-- **THEN** 系统按交易日顺序写入近 1 年所有交易日数据，每个指数应至少包含 200+ 个交易日记录
+- **THEN** 系统按交易日顺序写入近 1 年所有交易日数据，每个指数应至少包含 200+ 个交易日记录，且 `open_value / high_value / low_value / volume` 在数据源能返回的日子里均为非空
 
 #### Scenario: 已部分存在历史数据时只补齐缺失日期
 - **WHEN** `index_quotes` 已包含部分历史日期
 - **THEN** 回填仅请求并写入缺失日期的数据，不覆盖已有 `change_reason`
+
+### Requirement: 历史 OHLCV 一次性回填
+系统 SHALL 提供一个独立入口（CLI flag `--refresh-ohlcv` 或等价函数 `refreshOhlcvForExistingQuotes()`），用于在 schema 演进或数据源补齐后，重新拉取最近 N 天历史日线并仅以 COALESCE 方式补齐已有行的 OHLCV 字段，不修改 `close_value / change / change_pct / change_reason / reason_source`。
+
+#### Scenario: 老库已有 close 但缺 OHLCV，执行一次刷新
+- **WHEN** `index_quotes` 中已有 200+ 条历史记录但 `open_value / high_value / low_value / volume` 全为 NULL，并执行 `--refresh-ohlcv`
+- **THEN** 系统对每个目标指数重新拉取近 1 年日线，对每条命中已存在 `(index_code, trade_date)` 的记录，仅更新当前为 NULL 的 OHLCV 列；归因 (`change_reason`) 与 `change` / `change_pct` 维持原值不变；最终写出"updated=N failed=0"汇总日志
 
 ### Requirement: 每个交易日 14:00 自动采集
 系统 SHALL 通过 `node-cron`（或等价定时任务）在每个交易日北京时间 14:00 触发一次行情采集任务，对每个目标指数：拉取当日最新点位、读取上一交易日的 `close_value`、计算 `change` 与 `change_pct`、upsert 到 `index_quotes`，随后调用归因模块写回 `change_reason`。

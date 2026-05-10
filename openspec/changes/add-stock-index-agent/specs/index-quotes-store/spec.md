@@ -1,17 +1,38 @@
 ## ADDED Requirements
 
 ### Requirement: 指数行情持久化数据模型
-系统 SHALL 在 SQLite 数据库中维护一张 `index_quotes` 表，至少包含以下字段：`index_code`（指数代码，如 `000001.SH`）、`index_name`（指数名称，如 `上证指数`）、`trade_date`（交易日，`YYYY-MM-DD`）、`close_value`（收盘点位，REAL）、`change`（相较上一交易日点数变化，REAL）、`change_pct`（相较上一交易日涨跌百分比，REAL）、`change_reason`（涨跌原因文本，TEXT，可空）、`reason_source`（原因来源/链接，TEXT，可空）、`created_at`、`updated_at`。
+系统 SHALL 在 SQLite 数据库中维护一张 `index_quotes` 表，至少包含以下字段：
+
+- `index_code`（指数代码，如 `000001.SH`）
+- `index_name`（指数名称，如 `上证指数`）
+- `trade_date`（交易日，`YYYY-MM-DD`）
+- `close_value`（收盘点位，REAL，NOT NULL）
+- `open_value`（开盘点位，REAL，可空）
+- `high_value`（最高点位，REAL，可空）
+- `low_value`（最低点位，REAL，可空）
+- `volume`（成交量，REAL，可空，单位：手 / 东方财富口径）
+- `turnover`（成交额，REAL，可空，单位：元）
+- `change`（相较上一交易日点数变化，REAL，可空）
+- `change_pct`（相较上一交易日涨跌百分比，REAL，可空）
+- `change_reason`（涨跌原因文本，TEXT，可空）
+- `reason_source`（原因来源/链接，TEXT，可空）
+- `created_at`、`updated_at`
 
 `(index_code, trade_date)` MUST 为唯一约束；`trade_date` MUST 建立索引以支持按日期范围查询。
 
+OHLCV 五列（`open_value / high_value / low_value / volume / turnover`）MUST 允许为 NULL，以兼容数据源缺失或部分指数实时口径不全的情况；上层使用时 MUST 按 NULL 处理而不是 0。
+
 #### Scenario: 数据库初始化时创建表结构
 - **WHEN** 智能体进程首次启动且 `index_quotes` 表不存在
-- **THEN** 系统使用 `CREATE TABLE IF NOT EXISTS` 创建该表，并在 `(index_code, trade_date)` 上建立唯一索引
+- **THEN** 系统使用 `CREATE TABLE IF NOT EXISTS` 创建该表，包含上述全部 OHLCV 列，并在 `(index_code, trade_date)` 上建立唯一索引
+
+#### Scenario: 历史库前向迁移补 OHLCV 列
+- **WHEN** 进程启动时发现 `index_quotes` 表已存在但缺少 `open_value / high_value / low_value / volume / turnover` 中的任一列
+- **THEN** 系统通过 `PRAGMA table_info` 检测缺失列，并执行 `ALTER TABLE ADD COLUMN` 补齐，已有数据保留为 NULL，不报错、不丢数据
 
 #### Scenario: 重复插入同一交易日数据时执行 upsert
 - **WHEN** 同一 `(index_code, trade_date)` 已存在且新行情到达
-- **THEN** 系统更新 `close_value / change / change_pct / change_reason / reason_source / updated_at`，不创建重复行
+- **THEN** 系统更新 `close_value / change / change_pct / updated_at`；对 `open_value / high_value / low_value / volume / turnover / change_reason / reason_source` 使用 COALESCE 策略——只在已存在值为 NULL 时才用新值填补，不会覆盖既有非空字段
 
 ### Requirement: 行情查询接口
 系统 SHALL 暴露 `getQuote(indexCode, tradeDate)`、`getLatestQuote(indexCode)`、`getQuotesInRange(indexCode, startDate, endDate)`、`getPreviousTradingDay(indexCode, tradeDate)` 四个查询函数，用于上层归因与预测模块按指数和日期检索数据。

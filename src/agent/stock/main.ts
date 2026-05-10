@@ -1,10 +1,9 @@
 import "dotenv/config";
 import cron from "node-cron";
-import { getDb, getLatestQuote, getLatestMemory } from "./db/index.js";
-import { listTargetIndexes } from "./providers/index.js";
-import { backfillOneYear } from "./providers/ingestion.js";
+import { getDb } from "./db/index.js";
+import { backfillOneYear, refreshOhlcvForExistingQuotes } from "./providers/ingestion.js";
+import { backfillMarginHistory } from "./providers/margin.js";
 import { backfillReasons } from "./analysis/index.js";
-import { bootstrapPredictionMemory } from "./prediction/index.js";
 import { runOnce } from "./graph/index.js";
 import { predictAllTargets } from "./prediction/index.js";
 import { buildNotifier } from "./notify/index.js";
@@ -20,6 +19,8 @@ interface Cli {
   dryRun: boolean;
   selfCheck: boolean;
   predictOnly: boolean;
+  refreshOhlcv: boolean;
+  backfillFundflow: boolean;
 }
 
 function parseArgs(argv: string[]): Cli {
@@ -28,25 +29,14 @@ function parseArgs(argv: string[]): Cli {
     dryRun: argv.includes("--dry-run"),
     selfCheck: argv.includes("--self-check"),
     predictOnly: argv.includes("--predict-only"),
+    refreshOhlcv: argv.includes("--refresh-ohlcv"),
+    backfillFundflow: argv.includes("--backfill-fundflow"),
   };
 }
 
-async function ensureBootstrapped(): Promise<void> {
-  for (const meta of listTargetIndexes()) {
-    const latestQuote = getLatestQuote(meta.index_code);
-    if (!latestQuote) {
-      logStage({ stage: "bootstrap.skip_no_quotes", indexCode: meta.index_code, ok: true });
-      continue;
-    }
-    const memory = getLatestMemory(meta.index_code);
-    if (!memory) {
-      await timed("bootstrap_memory", meta.index_code, () => bootstrapPredictionMemory(meta.index_code));
-    }
-  }
-}
-
 async function initIfEmpty(): Promise<void> {
-  // 检查是否有任何行情数据，无则触发首次回填 + 归因 + bootstrap
+  // 检查是否有任何行情数据，无则触发首次回填 + 归因。
+  // 注意：当前预测模式（实时分析）不再依赖长期记忆，因此初始化阶段不再 bootstrap memory。
   const db = getDb();
   const cnt = (db.prepare("SELECT COUNT(*) as c FROM index_quotes").get() as { c: number }).c;
   if (cnt > 0) {
@@ -56,7 +46,6 @@ async function initIfEmpty(): Promise<void> {
   logStage({ stage: "init.start", ok: true });
   await timed("backfill", undefined, () => backfillOneYear());
   await timed("backfill_reasons", undefined, () => backfillReasons());
-  await ensureBootstrapped();
   logStage({ stage: "init.done", ok: true });
 }
 
@@ -71,6 +60,19 @@ async function main(): Promise<void> {
     const db = getDb();
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
     logStage({ stage: "self_check", ok: true, tables });
+    process.exit(0);
+  }
+
+  if (cli.refreshOhlcv) {
+    const r = await timed("refresh_ohlcv", undefined, () => refreshOhlcvForExistingQuotes());
+    logStage({ stage: "refresh_ohlcv.done", ok: true, ...r });
+    process.exit(0);
+  }
+
+  if (cli.backfillFundflow) {
+    const days = Number(process.env.STOCK_BACKFILL_DAYS ?? "365");
+    const r = await timed("backfill_fundflow", undefined, () => backfillMarginHistory(days));
+    logStage({ stage: "backfill_fundflow.done", ok: true, ...r, days });
     process.exit(0);
   }
 

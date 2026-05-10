@@ -6,10 +6,11 @@
 
 ## What Changes
 
-- 新增"指数行情数据"领域：在 SQLite 中建立 `index_quotes` 表，存储 `index_name / value / date / change / change_pct / change_reason`，支持按指数 + 日期检索与更新。
-- 新增**首次回填**流程：通过行情数据源拉取上证指数 + 创业板指近 1 年的日线数据；对每个交易日调用 LLM + `web_search` 分析涨跌原因并入库。
-- 新增**每日定时采集**流程：每个交易日 14:00 触发，抓取当日 SSE 与 ChiNext 行情，计算相较上一交易日涨跌，调用 LLM 联网分析原因，写入 `index_quotes`。
-- 新增**下一交易日预测**流程：首次基于全量历史做一次完整分析，结果以"长期分析记忆"形式写入新的 `index_analysis_memory` 表；后续预测仅基于"上一份长期记忆 + 当日新数据"增量分析，输出方向（买涨 / 买跌）、置信度与理由。
+- 新增"指数行情数据"领域：在 SQLite 中建立 `index_quotes` 表，存储完整 OHLCV 日线（`index_name / open / high / low / close / volume / turnover / date / change / change_pct / change_reason`），支持按指数 + 日期检索与更新。OHLCV 五列为可空，向前迁移幂等。
+- 新增**首次回填**流程：通过行情数据源拉取上证指数 + 创业板指近 1 年的日线数据（含 OHLCV）；对每个交易日调用 LLM + `web_search` 分析涨跌原因并入库。
+- 新增**每日定时采集**流程：每个交易日 14:00 触发，抓取当日 SSE 与 ChiNext 行情（含开高低收 + 量额），计算相较上一交易日涨跌，调用 LLM 联网分析原因，写入 `index_quotes`。
+- 新增**下一交易日预测**流程（实时分析模式）：每次预测**只**读取最近 30 个交易日的真实日线（OHLCV + 归因），不消费长期记忆作为 LLM 上下文；输出方向（买涨 / 买跌）、置信度与理由，结果写入 `index_analysis_memory.features.last_prediction` 用于事后查询。
+- 新增**历史 OHLCV 一次性回填工具**（`refreshOhlcvForExistingQuotes` / `--refresh-ohlcv`）：用 COALESCE 策略只补已有行的 OHLCV 字段，不动 close/change/reason，保证 schema 演进不破坏既有归因。
 - 新增**短信通知**：将每日预测结论以短信形式推送至 `15136489941`，内容覆盖上证指数与创业板指两个标的（用户只买这两只指数基金）。
 - 新增 LangGraph 子图（或独立 graph）`stockIndexAgent`，通过 `tools` 节点调用上述能力；保留现有通用 agent 不变。
 
