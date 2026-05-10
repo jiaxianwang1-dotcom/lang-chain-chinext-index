@@ -20,6 +20,9 @@ build/
 *.db-shm
 *.db-wal
 
+# Lock files
+package-lock.json
+
 # Logs
 *.log
 npm-debug.log*
