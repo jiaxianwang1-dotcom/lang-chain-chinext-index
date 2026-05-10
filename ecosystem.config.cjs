@@ -5,7 +5,7 @@ module.exports = {
       script: "web-agent.ts",
       interpreter: "npx",
       interpreter_args: "tsx",
-      cwd: "/root/lang-chain-graph",
+      cwd: "/opt/lang-chain-chinext-index",
       env: {
         NODE_ENV: "production",
         PORT: 3000,
