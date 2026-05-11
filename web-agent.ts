@@ -33,10 +33,26 @@ import {
   getLatestBreadth,
   getLatestSectorRotation,
   getNewsByDate,
+  getPredictionsInRange,
 } from "./src/agent/stock/db/index.js";
+import {
+  predictChangePctForTarget,
+  decideCardTarget,
+} from "./src/agent/stock/prediction/realtime-card.js";
 import { listTargetIndexes, findIndexMeta } from "./src/agent/stock/providers/index.js";
 import { predictAllTargets, predictNextTradingDay } from "./src/agent/stock/prediction/index.js";
 import { getLhbActivity, getLhbForIndex } from "./src/agent/stock/providers/lhb.js";
+import {
+  fetchQuoteWindow,
+  fetchTodayIntraday,
+  aggregateForLlm,
+  parseRange,
+  todayShanghai,
+  type QuoteRow,
+  type RangeKey,
+} from "./src/agent/stock/realtime/index.js";
+import { stockGraph, buildContextSystemMessage } from "./src/agent/stock/graph/index.js";
+import { logStage } from "./src/agent/stock/utils/log.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -838,8 +854,343 @@ app.get("/api/memories", (_req, res) => {
   res.json(rows);
 });
 
-const PORT = process.env.PORT ?? 3000;
-app.listen(PORT, () => {
-  console.log(`\n  🤖 智能体已启动`);
-  console.log(`  📡 访问 http://localhost:${PORT}\n`);
+// ==================== /api/stock/* 实时行情 + Tab UI 后端 ====================
+//
+// 这一组接口承载需求文档 docs/requirement/11.md 的"实时数据"诉求：
+// - 智能体问答（/api/stock/chat）：按窗口实时拉取后注入 LLM 上下文，不读 SQLite。
+// - 大盘 Tab 数据（/api/stock/quotes /quotes/today /trading-day）：纯实时。
+// 既有 cron + 短信 + 长期记忆链路完全不受影响。
+
+const VALID_RANGES: RangeKey[] = ["3d", "10d", "1m", "2m", "3m", "1y", "custom"];
+const STOCK_KEYWORDS = ["大盘", "上证", "创业板", "000001", "399006", "指数", "A股", "盘面", "沪指", "创指"];
+
+interface ParsedStockRangeQuery {
+  range: RangeKey;
+  from?: string;
+  to?: string;
+  start: string;
+  end: string;
+}
+
+/**
+ * 从 query / body 解析时间范围参数。失败时直接写 400 并返回 null，调用方
+ * 立即 return 即可。range 缺省视为 "1m"（30 天）。
+ */
+function parseStockRangeQuery(req: express.Request, res: express.Response): ParsedStockRangeQuery | null {
+  const source = (req.method === "GET" ? req.query : req.body) as Record<string, unknown>;
+  const rangeRaw = (source.range as string | undefined) ?? "1m";
+  if (!VALID_RANGES.includes(rangeRaw as RangeKey)) {
+    res.status(400).json({ error: "invalid range" });
+    return null;
+  }
+  const range = rangeRaw as RangeKey;
+  const from = source.from as string | undefined;
+  const to = source.to as string | undefined;
+  try {
+    const { start, end } = parseRange({ range, from, to });
+    return { range, from, to, start, end };
+  } catch (e) {
+    res.status(400).json({ error: e instanceof Error ? e.message : String(e) });
+    return null;
+  }
+}
+
+function rangeLabel(p: ParsedStockRangeQuery): string {
+  const map: Record<RangeKey, string> = {
+    "3d": "近 3 天",
+    "10d": "近 10 天",
+    "1m": "近 30 天",
+    "2m": "近 60 天",
+    "3m": "近 90 天",
+    "1y": "近一年",
+    custom: `${p.start} ~ ${p.end}`,
+  };
+  return map[p.range];
+}
+
+/**
+ * 严格判定：指定日期"此刻是否处于可拉实时盘中数据的时段"。给 /api/stock/trading-day
+ * 与前端 5 分钟轮询使用——开市前 / 收盘后都返回 false，避免轮询打到非盘中接口。
+ *
+ * 判定来源：
+ *   1) DB（index_quotes）中已有该日 row → true（已经成交并入库）
+ *   2) 否则按"周一至周五 + 当前时间在 09:30-11:30 / 13:00-15:00 (Asia/Shanghai)"启发判定。
+ *
+ * 不引入交易日历依赖；最坏后果是节假日上午误判为交易日 → 后续实时拉取失败时
+ * 由 5s LRU 吸收 + 502 暴露给前端，前端轮询时不会持续打满。
+ */
+function isTradingDayHeuristic(date: string, now: Date = new Date()): boolean {
+  for (const meta of listTargetIndexes()) {
+    if (getQuote(meta.index_code, date)) return true;
+  }
+  if (date !== todayShanghai(now)) return false;
+
+  const shanghai = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+  const dow = shanghai.getUTCDay(); // 0..6, 0=Sun
+  if (dow === 0 || dow === 6) return false;
+  const hh = shanghai.getUTCHours();
+  const mm = shanghai.getUTCMinutes();
+  const minutes = hh * 60 + mm;
+  const morning = minutes >= 9 * 60 + 30 && minutes <= 11 * 60 + 30;
+  const afternoon = minutes >= 13 * 60 && minutes <= 15 * 60;
+  return morning || afternoon;
+}
+
+/**
+ * 宽松判定：指定日期"是否大概率是交易日"。给 AI 卡片预测使用——开盘前（如 8:00）
+ * 也应当判定今日是交易日，从而预测当天涨跌幅而不是跳到下一交易日。
+ *
+ * 判定规则：
+ *   1) DB 中已有该日 row → true
+ *   2) 历史日期（早于今日）DB 无 row → false（节假日 / 周末，cron 也没补到）
+ *   3) 今日或未来：周一~周五 → true，周末 → false
+ *
+ * 节假日识别仍然有缺口（无交易日历），但对"开盘前预测今日"这种核心场景已经足够。
+ */
+function isLikelyTradingDay(date: string, now: Date = new Date()): boolean {
+  for (const meta of listTargetIndexes()) {
+    if (getQuote(meta.index_code, date)) return true;
+  }
+  const today = todayShanghai(now);
+  if (date < today) return false;
+  const d = new Date(`${date}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) return false;
+  const dow = d.getUTCDay();
+  return dow !== 0 && dow !== 6;
+}
+
+app.get("/api/stock/quotes", async (req, res) => {
+  const indexCode = String(req.query.indexCode ?? "");
+  const meta = findIndexMeta(indexCode);
+  if (!meta) {
+    res.status(400).json({ error: "unsupported indexCode" });
+    return;
+  }
+  const parsed = parseStockRangeQuery(req, res);
+  if (!parsed) return;
+
+  try {
+    const rows = await fetchQuoteWindow(indexCode, parsed.range, { from: parsed.from, to: parsed.to });
+    res.json({
+      indexCode,
+      indexName: meta.index_name,
+      range: parsed.range,
+      from: parsed.start,
+      to: parsed.end,
+      rows,
+    });
+  } catch (e) {
+    logStage({
+      stage: "realtime.fetch_failed",
+      indexCode,
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    res.status(502).json({ error: "upstream quote provider failed" });
+  }
 });
+
+app.get("/api/stock/quotes/today", async (req, res) => {
+  const indexCode = String(req.query.indexCode ?? "");
+  const meta = findIndexMeta(indexCode);
+  if (!meta) {
+    res.status(400).json({ error: "unsupported indexCode" });
+    return;
+  }
+  try {
+    const row = await fetchTodayIntraday(indexCode);
+    res.json({
+      indexCode,
+      indexName: meta.index_name,
+      row,
+      fetchedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    logStage({
+      stage: "realtime.fetch_today_failed",
+      indexCode,
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    res.status(502).json({ error: "upstream quote provider failed" });
+  }
+});
+
+app.get("/api/stock/trading-day", (req, res) => {
+  const date = (req.query.date as string | undefined) ?? todayShanghai();
+  const isTradingDay = isTradingDayHeuristic(date);
+  res.json({ date, isTradingDay });
+});
+
+// ==================== AI 涨跌幅预测 ====================
+//
+// - GET /api/stock/predictions          按窗口拉取已落库的预测，前端用于在大盘表格中渲染"AI 预测涨跌幅"列。
+// - GET /api/stock/predictions/card     卡片预测：目标日为"今日（交易日 < 14:30）"或"下一交易日"，
+//                                       若 DB 已有则直接返回；否则调 LLM 生成并落库。
+//
+// 预测结果统一存在 stock_agent.db 的 index_predictions 表，按 (index_code, target_date) 唯一。
+// 历史日期若未预测过，前端拿不到记录就展示 "--"。
+
+app.get("/api/stock/predictions", (req, res) => {
+  const indexCode = String(req.query.indexCode ?? "");
+  const meta = findIndexMeta(indexCode);
+  if (!meta) {
+    res.status(400).json({ error: "unsupported indexCode" });
+    return;
+  }
+  const parsed = parseStockRangeQuery(req, res);
+  if (!parsed) return;
+  try {
+    const rows = getPredictionsInRange(indexCode, parsed.start, parsed.end);
+    res.json({
+      indexCode,
+      indexName: meta.index_name,
+      from: parsed.start,
+      to: parsed.end,
+      rows,
+    });
+  } catch (e) {
+    logStage({
+      stage: "predictions.list_failed",
+      indexCode,
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    res.status(500).json({ error: "predictions query failed" });
+  }
+});
+
+app.get("/api/stock/predictions/card", async (req, res) => {
+  const indexCode = String(req.query.indexCode ?? "");
+  const meta = findIndexMeta(indexCode);
+  if (!meta) {
+    res.status(400).json({ error: "unsupported indexCode" });
+    return;
+  }
+  const force = String(req.query.force ?? "") === "1";
+  try {
+    const today = todayShanghai();
+    // 用宽松判定（不要求当前时间处于盘中时段）：开市前 8:00 也应判今日是交易日。
+    const isTodayTradingDay = isLikelyTradingDay(today);
+    const target = decideCardTarget(isTodayTradingDay);
+    const prediction = await predictChangePctForTarget(indexCode, target.target, { force });
+    res.json({
+      indexCode,
+      indexName: meta.index_name,
+      target: target.target,
+      reason: target.reason,
+      label: target.label,
+      isTodayTradingDay,
+      prediction,
+    });
+  } catch (e) {
+    logStage({
+      stage: "predictions.card_failed",
+      indexCode,
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    res.status(502).json({ error: "predict failed", message: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+app.post("/api/stock/chat", async (req, res) => {
+  const message = (req.body?.message as string | undefined)?.trim();
+  if (!message) {
+    res.status(400).json({ error: "message is required" });
+    return;
+  }
+  const parsed = parseStockRangeQuery(req, res);
+  if (!parsed) return;
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  const sseSend = (payload: unknown) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
+
+  // 关键字判定：是否需要注入实时大盘上下文。未命中则不浪费 token。
+  const isStockRelated = STOCK_KEYWORDS.some((kw) => message.includes(kw));
+  const messages: BaseMessage[] = [];
+
+  if (isStockRelated) {
+    try {
+      const inputs = await Promise.all(
+        listTargetIndexes().map(async (meta) => {
+          const rows = await fetchQuoteWindow(meta.index_code, parsed.range, {
+            from: parsed.from,
+            to: parsed.to,
+          });
+          const aggregated = rows.length > 90;
+          return {
+            indexCode: meta.index_code,
+            indexName: meta.index_name,
+            rows: aggregated ? aggregateForLlm(rows) : rows,
+            aggregated,
+          };
+        })
+      );
+      const aggregated = inputs.some((i) => i.aggregated);
+      const sysMsg = buildContextSystemMessage(
+        inputs.map((i) => ({ indexCode: i.indexCode, indexName: i.indexName, rows: i.rows })),
+        { rangeLabel: rangeLabel(parsed), aggregated }
+      );
+      messages.push(sysMsg);
+    } catch (e) {
+      logStage({
+        stage: "realtime.context_failed",
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      // 不阻塞问答：注入失败时退化为不带实时上下文，前端依然能拿到 LLM 回复
+      sseSend({ content: "[提示] 实时数据暂时不可用，本次回答未包含最新行情。\n" });
+    }
+  }
+  messages.push(new HumanMessage(message));
+
+  try {
+    const sessionId = (req.body?.thread_id as string | undefined) ?? "stock-default";
+    const stream = await stockGraph.stream(
+      { messages },
+      { configurable: { thread_id: sessionId } }
+    );
+
+    let fullResponse = "";
+    for await (const chunk of stream) {
+      for (const [nodeName, nodeOutput] of Object.entries(chunk)) {
+        const outMsgs = (nodeOutput as { messages: BaseMessage[] }).messages;
+        const lastMsg = outMsgs[outMsgs.length - 1];
+        if (nodeName === "agent" && typeof lastMsg.content === "string" && lastMsg.content) {
+          const text = lastMsg.content;
+          if (text.length > fullResponse.length) {
+            const delta = text.slice(fullResponse.length);
+            fullResponse = text;
+            sseSend({ content: delta });
+          }
+        }
+      }
+    }
+    sseSend({ done: true });
+    res.end();
+  } catch (e) {
+    logStage({
+      stage: "stock_chat.failed",
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    sseSend({ content: "抱歉，发生了错误，请稍后重试。" });
+    sseSend({ done: true });
+    res.end();
+  }
+});
+
+// 测试钩子：把 Express app 暴露出去，避免在测试中 listen 端口。
+export { app as _appForTest };
+
+if (process.env.WEB_AGENT_NO_LISTEN !== "1") {
+  const PORT = process.env.PORT ?? 3000;
+  app.listen(PORT, () => {
+    console.log(`\n  🤖 智能体已启动`);
+    console.log(`  📡 访问 http://localhost:${PORT}\n`);
+  });
+}

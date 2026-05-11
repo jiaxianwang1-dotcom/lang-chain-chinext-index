@@ -13,6 +13,7 @@ import { ToolNode } from "@langchain/langgraph/prebuilt";
 
 import { defaultProvider } from "../providers/index.js";
 import { backfillOneYear, ingestToday } from "../providers/ingestion.js";
+import type { QuoteRow } from "../realtime/index.js";
 import { ingestLatestMargin } from "../providers/margin.js";
 import { ingestMarketBreadth } from "../providers/breadth.js";
 import { ingestSectorRotation } from "../providers/sector.js";
@@ -185,6 +186,53 @@ const workflow = new StateGraph(StockState)
 
 const checkpointer = new MemorySaver();
 export const stockGraph = workflow.compile({ checkpointer });
+
+// ==================== 实时上下文注入 ====================
+//
+// `stockGraph` 本身不读 SQLite。Web 入口（/api/stock/chat）在调用前用
+// realtime-quote-service 拉好窗口数据，再用本函数生成一条 SystemMessage 注入；
+// 这样问答路径完全不依赖 cron 入库时延，符合需求文档 docs/requirement/11.md。
+
+export interface RealtimeContextInput {
+  indexCode: string;
+  indexName?: string;
+  rows: QuoteRow[];
+}
+
+export interface BuildContextOptions {
+  /** 时间范围的人类可读描述，例如 "近 30 天" / "2026-01-01 ~ 2026-05-11"。仅用于 prompt 头说明。 */
+  rangeLabel?: string;
+  /** 是否经过 aggregateForLlm 聚合；若是，prompt 头会注明"以下为周聚合数据"。 */
+  aggregated?: boolean;
+}
+
+/**
+ * 构造一条供 LLM 使用的 system 消息，把多个指数的实时窗口数据序列化为 JSON。
+ * 字段名与 db.IndexQuoteRow 完全一致 → 智能体可以沿用既有 prompt 与表达习惯，
+ * 上层不必重写任何工具。
+ */
+export function buildContextSystemMessage(
+  inputs: RealtimeContextInput[],
+  opts: BuildContextOptions = {}
+): SystemMessage {
+  const header: string[] = [];
+  header.push("以下为实时盘中数据（非来自 SQLite，可能与 14:00 收盘后归因不一致）。");
+  if (opts.rangeLabel) header.push(`时间窗口：${opts.rangeLabel}。`);
+  if (opts.aggregated) header.push("注：窗口超过 90 个交易日，已按 5 个交易日做周聚合。");
+  header.push("字段口径与 index_quotes 表一致（trade_date / open_value / high_value / low_value / close_value / volume / turnover / change / change_pct）。");
+
+  if (inputs.length === 0 || inputs.every((i) => i.rows.length === 0)) {
+    return new SystemMessage(`${header.join(" ")}\n（实时数据暂时不可用，请基于通用知识谨慎回答，并提示用户稍后重试。）`);
+  }
+
+  const blocks = inputs.map((i) => {
+    const name = i.indexName ?? i.rows[0]?.index_name ?? i.indexCode;
+    const json = JSON.stringify(i.rows);
+    return `# ${name} (${i.indexCode}) 共 ${i.rows.length} 行\n${json}`;
+  });
+
+  return new SystemMessage(`${header.join(" ")}\n\n${blocks.join("\n\n")}`);
+}
 
 // ==================== runOnce（直接函数调用，不走 LLM 决策）====================
 

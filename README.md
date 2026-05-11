@@ -39,13 +39,31 @@ npm run stock
 
 数据存放在 `.memory/stock_agent.db`（与通用 agent 的 `web_agent.db` 隔离）。
 
-### 三、风险声明
+### 三、Web UI（Tab 化版）
+
+`npm run web` 启动 Express 服务（默认 `http://localhost:3000`），新版前端把页面拆为两个 Tab：
+
+- **智能咨询**：保留对话气泡，新增**时间范围选择器**（近 3 天 / 10 天 / 1 月 / 2 月 / 3 月 / 1 年 / 自定义）。当用户提问命中大盘关键词（"大盘 / 上证 / 创业板 / 000001 / 399006 / 指数 / A股 / 盘面 / 沪指 / 创指"）时，服务端按所选窗口（默认 30 天）实时拉取上证 + 创业板 OHLCV，用与 `index_quotes` 同字段的 JSON 注入 LLM；超过 90 个交易日自动按 5 个交易日做周聚合。
+- **大盘指数**：上证指数 + 创业板指双卡片，含相同的时间范围选择器、收盘折线图与 9 列明细表（`trade_date / open_value / high_value / low_value / close_value / change / change_pct / volume / turnover`）。当所选窗口包含**今日**且当前判定为交易日时，自动每 5 分钟调一次 `/api/stock/quotes/today` 就地刷新今日那一行（页面隐藏 / 切到其他 Tab 时自动暂停）。
+
+#### 后端 API
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/stock/chat` | SSE 流式问答；`{ message, range, from?, to?, thread_id? }` |
+| `GET`  | `/api/stock/quotes` | 窗口内日线行情；`?indexCode=&range=&from=&to=` |
+| `GET`  | `/api/stock/quotes/today` | 当日实时点位；`?indexCode=` |
+| `GET`  | `/api/stock/trading-day` | 交易日判定（DB ∪ 时段启发式）；`?date=` |
+
+实时数据全部走 `realtime-quote-service`（`src/agent/stock/realtime/`），不写 SQLite；既有 cron 14:00 入库 + 短信链路保持不变。`fetchQuoteWindow` 5 秒 LRU、`fetchTodayIntraday` 30 秒 LRU，前端轮询固定 5 分钟，避免数据源被打爆。
+
+### 四、风险声明
 
 - 本智能体仅基于公开行情数据 + 联网搜索 + LLM 启发式分析，**不构成投资建议**。
 - 个人本地部署，需要进程常驻。建议用 PM2 / systemd / 服务器托管以避免笔记本休眠导致 cron 漏触发。
 - LLM 与免费行情接口都可能不稳定，所有预测结果均带"置信度"，请自行评估后再做投资决策。
 
-更多细节见 [`openspec/changes/add-stock-index-agent/`](./openspec/changes/add-stock-index-agent/) 与（实现完成后）`docs/stock-index-agent.md`。
+更多细节见 [`openspec/changes/add-stock-index-agent/`](./openspec/changes/add-stock-index-agent/)、[`openspec/changes/realtime-quotes-tabbed-web-ui/`](./openspec/changes/realtime-quotes-tabbed-web-ui/) 与 `docs/stock-index-agent.md`。
 
 ---
 

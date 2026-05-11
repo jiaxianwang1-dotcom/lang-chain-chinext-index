@@ -3,53 +3,10 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>智能体助手</title>
+  <title>智能体助手 + 大盘指数</title>
+  <link rel="stylesheet" href="/common.css">
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: #f0f2f5;
-      height: 100vh;
-      display: flex;
-      flex-direction: column;
-    }
-
-    .header {
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      color: white;
-      padding: 16px 24px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.15);
-    }
-
-    .header h1 {
-      font-size: 20px;
-      font-weight: 600;
-    }
-
-    .header .subtitle {
-      font-size: 12px;
-      opacity: 0.8;
-    }
-
-    .header-actions button {
-      background: rgba(255,255,255,0.2);
-      border: 1px solid rgba(255,255,255,0.3);
-      color: white;
-      padding: 6px 14px;
-      border-radius: 6px;
-      cursor: pointer;
-      font-size: 13px;
-      transition: background 0.2s;
-    }
-
-    .header-actions button:hover {
-      background: rgba(255,255,255,0.3);
-    }
-
+    /* ========== 智能咨询 Tab 专属样式（迁移自旧版 inline） ========== */
     .chat-container {
       flex: 1;
       overflow-y: auto;
@@ -58,466 +15,203 @@
       width: 100%;
       margin: 0 auto;
     }
-
-    .message {
-      margin-bottom: 16px;
-      display: flex;
-      gap: 10px;
-      animation: fadeIn 0.3s ease;
-    }
-
+    .message { margin-bottom: 16px; display: flex; gap: 10px; animation: fadeIn 0.3s ease; }
     @keyframes fadeIn {
       from { opacity: 0; transform: translateY(8px); }
       to { opacity: 1; transform: translateY(0); }
     }
-
     .message.user { justify-content: flex-end; }
     .message.assistant { justify-content: flex-start; }
-
     .avatar {
-      width: 36px;
-      height: 36px;
-      border-radius: 50%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 18px;
-      flex-shrink: 0;
+      width: 36px; height: 36px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px; flex-shrink: 0;
     }
-
     .message.user .avatar { background: #667eea; }
     .message.assistant .avatar { background: #e8e8e8; }
-
     .bubble {
-      max-width: 70%;
-      padding: 12px 16px;
-      border-radius: 16px;
-      line-height: 1.6;
-      font-size: 14px;
-      word-break: break-word;
-      white-space: pre-wrap;
+      max-width: 70%; padding: 12px 16px; border-radius: 16px;
+      line-height: 1.6; font-size: 14px;
+      word-break: break-word; white-space: pre-wrap;
     }
-
     .message.user .bubble {
       background: linear-gradient(135deg, #667eea, #764ba2);
-      color: white;
-      border-bottom-right-radius: 4px;
+      color: white; border-bottom-right-radius: 4px;
     }
-
     .message.assistant .bubble {
-      background: white;
-      color: #333;
+      background: white; color: #333;
       border-bottom-left-radius: 4px;
       box-shadow: 0 1px 4px rgba(0,0,0,0.08);
     }
-
-    .bubble .tool-call {
-      background: #f0f7ff;
-      border-left: 3px solid #667eea;
-      padding: 8px 12px;
-      border-radius: 4px;
-      margin-bottom: 8px;
-      font-size: 12px;
-      color: #555;
-    }
-
-    .typing-indicator {
-      display: inline-flex;
-      gap: 4px;
-      padding: 4px 0;
-    }
-
+    .typing-indicator { display: inline-flex; gap: 4px; padding: 4px 0; }
     .typing-indicator span {
-      width: 6px;
-      height: 6px;
-      background: #999;
-      border-radius: 50%;
+      width: 6px; height: 6px; background: #999; border-radius: 50%;
       animation: typing 1.4s infinite;
     }
-
     .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
     .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
-
     @keyframes typing {
       0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
       30% { transform: translateY(-6px); opacity: 1; }
     }
-
     .input-area {
-      background: white;
-      border-top: 1px solid #e5e5e5;
-      padding: 16px 20px;
-      max-width: 800px;
-      width: 100%;
-      margin: 0 auto;
+      background: white; border-top: 1px solid #e5e5e5;
+      padding: 14px 20px; max-width: 800px; width: 100%; margin: 0 auto;
     }
-
-    .input-wrapper {
-      display: flex;
-      gap: 10px;
-      align-items: flex-end;
-    }
-
+    .input-wrapper { display: flex; gap: 10px; align-items: flex-end; }
     .input-wrapper textarea {
-      flex: 1;
-      border: 1px solid #ddd;
-      border-radius: 12px;
-      padding: 12px 16px;
-      font-size: 14px;
-      font-family: inherit;
-      resize: none;
-      outline: none;
-      max-height: 120px;
-      line-height: 1.5;
+      flex: 1; border: 1px solid #ddd; border-radius: 12px;
+      padding: 12px 16px; font-size: 14px; font-family: inherit;
+      resize: none; outline: none; max-height: 120px; line-height: 1.5;
       transition: border-color 0.2s;
     }
-
-    .input-wrapper textarea:focus {
-      border-color: #667eea;
-    }
-
+    .input-wrapper textarea:focus { border-color: #667eea; }
     .input-wrapper button {
       background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      color: white;
-      border: none;
-      width: 44px;
-      height: 44px;
-      border-radius: 12px;
-      cursor: pointer;
-      font-size: 18px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      transition: transform 0.1s, opacity 0.2s;
-      flex-shrink: 0;
+      color: white; border: none; width: 44px; height: 44px;
+      border-radius: 12px; cursor: pointer; font-size: 18px;
+      display: flex; align-items: center; justify-content: center;
+      transition: transform 0.1s, opacity 0.2s; flex-shrink: 0;
     }
-
     .input-wrapper button:hover { transform: scale(1.05); }
     .input-wrapper button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
-
-    .welcome {
-      text-align: center;
-      padding: 60px 20px;
-      color: #888;
-    }
-
-    .welcome h2 {
-      font-size: 24px;
-      color: #555;
-      margin-bottom: 12px;
-    }
-
-    .welcome p { font-size: 14px; margin-bottom: 8px; }
-
-    .suggestions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      justify-content: center;
-      margin-top: 20px;
-    }
-
+    .welcome { text-align: center; padding: 60px 20px; color: #888; }
+    .welcome h2 { font-size: 22px; color: #555; margin-bottom: 12px; }
+    .welcome p { font-size: 14px; margin-bottom: 6px; }
+    .suggestions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 18px; }
     .suggestions button {
-      background: white;
-      border: 1px solid #ddd;
-      padding: 8px 16px;
-      border-radius: 20px;
-      cursor: pointer;
-      font-size: 13px;
-      color: #555;
-      transition: all 0.2s;
+      background: white; border: 1px solid #ddd;
+      padding: 7px 14px; border-radius: 20px; cursor: pointer;
+      font-size: 13px; color: #555; transition: all 0.2s;
     }
+    .suggestions button:hover { border-color: #667eea; color: #667eea; background: #f0f4ff; }
 
-    .suggestions button:hover {
-      border-color: #667eea;
-      color: #667eea;
-      background: #f0f4ff;
+    /* ========== 大盘指数 Tab 专属样式 ========== */
+    .stock-cards {
+      flex: 1; overflow-y: auto; padding: 16px;
+      display: grid; gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(520px, 1fr));
     }
-
-    .memories-panel {
-      display: none;
-      position: fixed;
-      top: 0;
-      right: 0;
-      width: 360px;
-      height: 100vh;
-      background: white;
-      box-shadow: -4px 0 20px rgba(0,0,0,0.1);
-      z-index: 100;
-      flex-direction: column;
+    .stock-card {
+      background: white; border-radius: 12px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+      padding: 16px 18px; display: flex; flex-direction: column; gap: 10px;
+      min-width: 0;
     }
-
-    .memories-panel.open { display: flex; }
-
-    .memories-panel .panel-header {
-      padding: 16px 20px;
+    .card-head {
+      display: flex; justify-content: space-between; align-items: flex-start;
+      gap: 12px; padding-bottom: 8px; border-bottom: 1px solid #f0f0f0;
+    }
+    .card-title { font-size: 16px; font-weight: 600; color: #333; }
+    .card-sub { font-size: 12px; color: #888; margin-top: 2px; }
+    .card-latest { text-align: right; }
+    .latest-close { font-size: 20px; font-weight: 600; color: #333; }
+    .latest-pct { font-size: 13px; margin-top: 2px; color: #888; }
+    .latest-pct.up { color: #c0392b; }
+    .latest-pct.down { color: #27ae60; }
+    .latest-time { font-size: 11px; color: #aaa; margin-top: 2px; }
+    .card-predict {
+      display: flex; flex-direction: column; gap: 4px;
+      background: #f7f8fc; border: 1px dashed #d9def0; border-radius: 8px;
+      padding: 8px 12px; font-size: 12px; color: #666;
+    }
+    .card-predict .pred-label { font-size: 11px; color: #888; }
+    .card-predict .pred-main {
+      display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+    }
+    .card-predict .pred-pct { font-size: 18px; font-weight: 600; color: #555; }
+    .card-predict .pred-pct.up { color: #c0392b; }
+    .card-predict .pred-pct.down { color: #27ae60; }
+    .card-predict .pred-conf { font-size: 11px; color: #999; }
+    .card-predict .pred-rationale { font-size: 11px; color: #888; line-height: 1.5; }
+    .card-predict button.pred-refresh {
+      align-self: flex-start; background: transparent; border: 1px solid #c7cce0;
+      color: #667eea; border-radius: 4px; font-size: 11px;
+      padding: 2px 8px; cursor: pointer; margin-top: 2px;
+    }
+    .card-predict button.pred-refresh:hover { border-color: #667eea; background: #eef1ff; }
+    .card-predict button.pred-refresh:disabled { opacity: 0.5; cursor: not-allowed; }
+    .card-chart-wrap { height: 200px; position: relative; }
+    .card-table-wrap { max-height: 280px; overflow: auto; border: 1px solid #f0f0f0; border-radius: 6px; }
+    .quotes-table {
+      width: 100%; border-collapse: collapse; font-size: 12px;
+    }
+    .quotes-table thead th {
+      background: #fafbfd; color: #666; font-weight: 500;
+      text-align: right; padding: 8px 10px; position: sticky; top: 0;
       border-bottom: 1px solid #eee;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
+      font-family: SFMono-Regular, Menlo, Consolas, monospace;
     }
-
-    .memories-panel .panel-header h3 { font-size: 16px; }
-
-    .memories-panel .close-btn {
-      background: none;
-      border: none;
-      font-size: 20px;
-      cursor: pointer;
-      color: #999;
+    .quotes-table thead th:first-child { text-align: left; }
+    .quotes-table tbody td {
+      padding: 6px 10px; text-align: right; border-bottom: 1px solid #f5f5f5;
+      font-family: SFMono-Regular, Menlo, Consolas, monospace;
     }
-
-    .memories-list {
-      flex: 1;
-      overflow-y: auto;
-      padding: 16px;
-    }
-
-    .memory-item {
-      padding: 12px;
-      background: #f8f9fa;
-      border-radius: 8px;
-      margin-bottom: 8px;
-    }
-
-    .memory-item .key {
-      font-weight: 600;
-      color: #667eea;
-      font-size: 13px;
-    }
-
-    .memory-item .value {
-      font-size: 13px;
-      color: #555;
-      margin-top: 4px;
-    }
-
-    .memory-item .time {
-      font-size: 11px;
-      color: #aaa;
-      margin-top: 4px;
-    }
-
-    .memories-empty {
-      text-align: center;
-      color: #aaa;
-      padding: 40px;
-      font-size: 14px;
+    .quotes-table tbody td:first-child { text-align: left; color: #555; }
+    .quotes-table td.up { color: #c0392b; }
+    .quotes-table td.down { color: #27ae60; }
+    .card-status { font-size: 12px; color: #999; min-height: 16px; }
+    .card-status button {
+      background: #667eea; color: white; border: none;
+      border-radius: 4px; padding: 3px 10px; margin-left: 6px;
+      cursor: pointer; font-size: 12px;
     }
   </style>
 </head>
 <body>
-
   <div class="header">
     <div>
-      <h1>AI 智能助手</h1>
-      <div class="subtitle">长期记忆 · 联网搜索 · 上下文压缩</div>
-    </div>
-    <div class="header-actions">
-      <button onclick="toggleMemories()">记忆库</button>
-      <button onclick="clearChat()">新对话</button>
+      <h1>AI 智能助手 · 大盘指数</h1>
+      <div class="subtitle">实时行情 · 智能问答 · 多窗口切换 · 5 分钟自动刷新</div>
     </div>
   </div>
 
-  <div class="chat-container" id="chatContainer">
-    <div class="welcome" id="welcome">
-      <h2>👋 你好，我是你的智能助手</h2>
-      <p>我具备长期记忆能力，能记住你告诉我的信息</p>
-      <p>还可以联网搜索，获取最新资讯</p>
-      <div class="suggestions">
-        <button onclick="sendSuggestion('你好，我是小明，我是一名前端工程师')">自我介绍</button>
-        <button onclick="sendSuggestion('今天有什么科技新闻？')">科技新闻</button>
-        <button onclick="sendSuggestion('帮我记住，我最喜欢的编程语言是 TypeScript')">保存记忆</button>
-        <button onclick="sendSuggestion('你还记得关于我的什么信息吗？')">回忆记忆</button>
-      </div>
-    </div>
-  </div>
+  <nav class="tabs">
+    <button class="tab" data-tab="chat">智能咨询</button>
+    <button class="tab" data-tab="stock">大盘指数</button>
+  </nav>
 
-  <div class="input-area">
-    <div class="input-wrapper">
-      <textarea
-        id="messageInput"
-        placeholder="输入消息... (Enter 发送, Shift+Enter 换行)"
-        rows="1"
-        onkeydown="handleKeydown(event)"
-        oninput="autoResize(this)"
-      ></textarea>
-      <button id="sendBtn" onclick="sendMessage()">➤</button>
-    </div>
-  </div>
-
-  <div class="memories-panel" id="memoriesPanel">
-    <div class="panel-header">
-      <h3>🧠 记忆库</h3>
-      <button class="close-btn" onclick="toggleMemories()">✕</button>
-    </div>
-    <div class="memories-list" id="memoriesList"></div>
-  </div>
-
-  <script>
-    const chatContainer = document.getElementById('chatContainer');
-    const messageInput = document.getElementById('messageInput');
-    const sendBtn = document.getElementById('sendBtn');
-    const welcome = document.getElementById('welcome');
-    let isStreaming = false;
-
-    function autoResize(el) {
-      el.style.height = 'auto';
-      el.style.height = Math.min(el.scrollHeight, 120) + 'px';
-    }
-
-    function handleKeydown(e) {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        sendMessage();
-      }
-    }
-
-    function sendSuggestion(text) {
-      messageInput.value = text;
-      sendMessage();
-    }
-
-    function addMessage(role, content) {
-      if (welcome) welcome.style.display = 'none';
-
-      const div = document.createElement('div');
-      div.className = `message ${role}`;
-
-      if (role === 'user') {
-        div.innerHTML = `
-          <div class="bubble">${escapeHtml(content)}</div>
-          <div class="avatar">👤</div>
-        `;
-      } else {
-        div.innerHTML = `
-          <div class="avatar">🤖</div>
-          <div class="bubble">${content}</div>
-        `;
-      }
-
-      chatContainer.appendChild(div);
-      chatContainer.scrollTop = chatContainer.scrollHeight;
-      return div;
-    }
-
-    function addStreamingMessage() {
-      if (welcome) welcome.style.display = 'none';
-
-      const div = document.createElement('div');
-      div.className = 'message assistant';
-      div.innerHTML = `
-        <div class="avatar">🤖</div>
-        <div class="bubble">
-          <div class="typing-indicator"><span></span><span></span><span></span></div>
+  <main>
+    <!-- 智能咨询 Tab -->
+    <section class="panel" data-panel="chat">
+      <div class="chat-container" id="chatContainer">
+        <div class="welcome" id="welcome">
+          <h2>👋 你好，我是你的智能助手</h2>
+          <p>我可以基于实时行情数据回答大盘问题</p>
+          <p>请在上方选择时间范围（默认近 30 天）</p>
+          <div class="suggestions">
+            <button onclick="sendSuggestion('上证最近表现怎么样？')">上证最近表现</button>
+            <button onclick="sendSuggestion('近一年创业板涨跌幅')">创业板年度</button>
+            <button onclick="sendSuggestion('今天大盘走势如何？')">今日大盘</button>
+            <button onclick="sendSuggestion('A股最近有什么消息面')">消息面</button>
+          </div>
         </div>
-      `;
-      chatContainer.appendChild(div);
-      chatContainer.scrollTop = chatContainer.scrollHeight;
-      return div;
-    }
+      </div>
+      <div class="input-area">
+        <div class="input-wrapper">
+          <textarea id="messageInput" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)" rows="1"></textarea>
+          <button id="sendBtn">➤</button>
+        </div>
+      </div>
+    </section>
 
-    function escapeHtml(text) {
-      const div = document.createElement('div');
-      div.textContent = text;
-      return div.innerHTML;
-    }
+    <!-- 大盘指数 Tab -->
+    <section class="panel" data-panel="stock"></section>
+  </main>
 
-    async function sendMessage() {
-      const message = messageInput.value.trim();
-      if (!message || isStreaming) return;
-
-      isStreaming = true;
-      sendBtn.disabled = true;
-      messageInput.value = '';
-      messageInput.style.height = 'auto';
-
-      addMessage('user', message);
-      const assistantDiv = addStreamingMessage();
-      const bubble = assistantDiv.querySelector('.bubble');
-
-      try {
-        const res = await fetch('/api/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message }),
-        });
-
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let fullText = '';
-        let buffer = '';
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-
-          for (const line of lines) {
-            if (!line.startsWith('data: ')) continue;
-            try {
-              const data = JSON.parse(line.slice(6));
-              if (data.content) {
-                fullText += data.content;
-                bubble.innerHTML = escapeHtml(fullText);
-                chatContainer.scrollTop = chatContainer.scrollHeight;
-              }
-              if (data.done) {
-                if (!fullText) {
-                  bubble.innerHTML = '（无回复）';
-                }
-              }
-            } catch {}
-          }
-        }
-      } catch (err) {
-        bubble.innerHTML = '❌ 连接失败，请检查服务器是否正常运行';
-      } finally {
-        isStreaming = false;
-        sendBtn.disabled = false;
-        messageInput.focus();
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="/common.js"></script>
+  <script src="/chat.js"></script>
+  <script src="/stock.js"></script>
+  <script>
+    // 把 Tab 切换与 stock 模块的激活/暂停钩起来：
+    window.AppCommon.setupTabs(function (name) {
+      if (name === "stock") {
+        window.StockTab && window.StockTab.onActivate();
+      } else {
+        window.StockTab && window.StockTab.onDeactivate();
       }
-    }
-
-    function clearChat() {
-      chatContainer.innerHTML = '';
-      if (welcome) {
-        chatContainer.appendChild(welcome);
-        welcome.style.display = '';
-      }
-    }
-
-    async function toggleMemories() {
-      const panel = document.getElementById('memoriesPanel');
-      panel.classList.toggle('open');
-
-      if (panel.classList.contains('open')) {
-        const list = document.getElementById('memoriesList');
-        try {
-          const res = await fetch('/api/memories');
-          const memories = await res.json();
-
-          if (memories.length === 0) {
-            list.innerHTML = '<div class="memories-empty">暂无记忆</div>';
-          } else {
-            list.innerHTML = memories.map(m => `
-              <div class="memory-item">
-                <div class="key">${escapeHtml(m.key)}</div>
-                <div class="value">${escapeHtml(m.content)}</div>
-                <div class="time">${new Date(m.updatedAt).toLocaleString('zh-CN')}</div>
-              </div>
-            `).join('');
-          }
-        } catch {
-          list.innerHTML = '<div class="memories-empty">加载失败</div>';
-        }
-      }
-    }
-
-    messageInput.focus();
+    });
   </script>
 </body>
 </html>

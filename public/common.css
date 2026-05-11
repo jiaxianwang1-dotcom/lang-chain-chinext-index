@@ -1,0 +1,107 @@
+/* ==================== 全局基础 ==================== */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #f0f2f5;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  color: #333;
+}
+
+.header {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  padding: 14px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+}
+.header h1 { font-size: 18px; font-weight: 600; }
+.header .subtitle { font-size: 12px; opacity: 0.85; }
+
+/* ==================== Tabs ==================== */
+.tabs {
+  background: white;
+  border-bottom: 1px solid #e5e5e5;
+  display: flex;
+  padding: 0 16px;
+}
+.tab {
+  background: none;
+  border: none;
+  padding: 14px 20px;
+  font-size: 14px;
+  cursor: pointer;
+  color: #666;
+  border-bottom: 2px solid transparent;
+  transition: all 0.18s;
+}
+.tab:hover { color: #667eea; }
+.tab.active {
+  color: #667eea;
+  border-bottom-color: #667eea;
+  font-weight: 600;
+}
+
+main { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+.panel { display: none; flex: 1; overflow: hidden; flex-direction: column; }
+.panel.active { display: flex; }
+
+/* ==================== 时间范围选择器 ==================== */
+.range-bar {
+  background: white;
+  border-bottom: 1px solid #eee;
+  padding: 10px 20px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: #555;
+}
+.range-bar .label { font-weight: 600; margin-right: 4px; }
+.range-bar .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.range-bar .chip {
+  background: #f4f6fa;
+  border: 1px solid #e3e6ee;
+  padding: 5px 12px;
+  border-radius: 14px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+  color: #555;
+}
+.range-bar .chip:hover { border-color: #667eea; color: #667eea; }
+.range-bar .chip.active {
+  background: #667eea;
+  color: white;
+  border-color: #667eea;
+}
+.range-bar .custom-dates {
+  display: none;
+  gap: 6px;
+  align-items: center;
+  margin-left: 8px;
+}
+.range-bar .custom-dates.show { display: inline-flex; }
+.range-bar input[type="date"] {
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-family: inherit;
+}
+.range-bar .apply-btn {
+  background: #667eea;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.range-bar .apply-btn:disabled { background: #ccc; cursor: not-allowed; }
+.range-bar .hint { color: #d33; font-size: 12px; margin-left: 8px; }

@@ -159,6 +159,24 @@ export function getDb(): Database.Database {
     );
     CREATE INDEX IF NOT EXISTS idx_news_event_date ON news_event(as_of_date DESC);
     CREATE INDEX IF NOT EXISTS idx_news_event_dedup ON news_event(as_of_date, title);
+
+    -- ============ AI 涨跌幅预测：按 (index_code, target_date) 唯一 ============
+    CREATE TABLE IF NOT EXISTS index_predictions (
+      id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+      index_code            TEXT NOT NULL,
+      target_date           TEXT NOT NULL,        -- 预测目标交易日 YYYY-MM-DD
+      predicted_change_pct  REAL,                  -- 预测涨跌幅（%，已是 1.5 表示 +1.5%）
+      direction             TEXT,                  -- "up" / "down"
+      confidence            REAL,                  -- 0 ~ 1
+      rationale             TEXT,                  -- LLM 给出的理由
+      model                 TEXT,                  -- 模型标识，如 "glm-4-flash"
+      based_on_date         TEXT,                  -- 预测时所用最后一日数据
+      predicted_at          TEXT NOT NULL,         -- 预测生成时间 ISO
+      created_at            TEXT NOT NULL,
+      updated_at            TEXT NOT NULL,
+      UNIQUE(index_code, target_date)
+    );
+    CREATE INDEX IF NOT EXISTS idx_predictions_code_date ON index_predictions(index_code, target_date DESC);
   `);
 
   // 给已经存在的 index_quotes 表补齐 OHLCV 列（向前迁移，幂等）
@@ -699,6 +717,102 @@ export function getNewsByDate(date: string, limit = 20): NewsEventRow[] {
     .all(date, limit) as NewsEventRow[];
 }
 
+// ==================== AI 涨跌幅预测 CRUD ====================
+
+export interface IndexPredictionRow {
+  id?: number;
+  index_code: string;
+  target_date: string;
+  predicted_change_pct: number | null;
+  direction: "up" | "down" | null;
+  confidence: number | null;
+  rationale: string | null;
+  model: string | null;
+  based_on_date: string | null;
+  predicted_at: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export function upsertPrediction(row: IndexPredictionRow): IndexPredictionRow {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const existing = db
+    .prepare("SELECT id FROM index_predictions WHERE index_code = ? AND target_date = ?")
+    .get(row.index_code, row.target_date) as { id: number } | undefined;
+
+  if (existing) {
+    db.prepare(
+      `UPDATE index_predictions
+       SET predicted_change_pct = ?,
+           direction = ?,
+           confidence = ?,
+           rationale = ?,
+           model = ?,
+           based_on_date = ?,
+           predicted_at = ?,
+           updated_at = ?
+       WHERE id = ?`
+    ).run(
+      row.predicted_change_pct,
+      row.direction,
+      row.confidence,
+      row.rationale,
+      row.model,
+      row.based_on_date,
+      row.predicted_at,
+      now,
+      existing.id
+    );
+    return { ...row, id: existing.id, updated_at: now };
+  }
+
+  const result = db
+    .prepare(
+      `INSERT INTO index_predictions
+       (index_code, target_date, predicted_change_pct, direction, confidence,
+        rationale, model, based_on_date, predicted_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      row.index_code,
+      row.target_date,
+      row.predicted_change_pct,
+      row.direction,
+      row.confidence,
+      row.rationale,
+      row.model,
+      row.based_on_date,
+      row.predicted_at,
+      now,
+      now
+    );
+  return { ...row, id: Number(result.lastInsertRowid), created_at: now, updated_at: now };
+}
+
+export function getPrediction(indexCode: string, targetDate: string): IndexPredictionRow | null {
+  const db = getDb();
+  const row = db
+    .prepare("SELECT * FROM index_predictions WHERE index_code = ? AND target_date = ?")
+    .get(indexCode, targetDate) as IndexPredictionRow | undefined;
+  return row ?? null;
+}
+
+export function getPredictionsInRange(
+  indexCode: string,
+  startDate: string,
+  endDate: string
+): IndexPredictionRow[] {
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT * FROM index_predictions
+       WHERE index_code = ? AND target_date >= ? AND target_date <= ?
+       ORDER BY target_date ASC`
+    )
+    .all(indexCode, startDate, endDate) as IndexPredictionRow[];
+}
+
 // ==================== 测试辅助 ====================
 
 /** 仅用于测试：重新打开一个独立 DB 实例（不影响默认 _db）。*/
@@ -782,6 +896,14 @@ export function openDbForTest(path: string): Database.Database {
       as_of_date TEXT NOT NULL, source TEXT, url TEXT, title TEXT NOT NULL,
       summary TEXT, category TEXT, sentiment REAL, impact_indices TEXT, rationale TEXT,
       created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS index_predictions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      index_code TEXT NOT NULL, target_date TEXT NOT NULL,
+      predicted_change_pct REAL, direction TEXT, confidence REAL, rationale TEXT,
+      model TEXT, based_on_date TEXT,
+      predicted_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      UNIQUE(index_code, target_date)
     );
   `);
   return db;
