@@ -19,14 +19,47 @@ import { logStage } from "../utils/log.js";
  * 全部接口均为公开 + 免费 + 实时：失败时静默降级（写 0 条），不阻塞预测。
  */
 
-// 每个 symbol 配置主源（国内 IP 最稳）+ 雅虎降级源（境内境外都能访问）。
-// 主源失败（空字符串 / 5xx / 网络错）时自动 fallback 到雅虎，保证 IDC / 境外服务器上不开天窗。
+// 三级降级链：
+//   1. 主源（sina / 腾讯）— 国内 IP 最稳、字段全
+//   2. 东方财富 push2 — sina/腾讯被屏蔽时（IDC 服务器常见）；境内境外多数可达
+//   3. 雅虎 — 主要为境外服务器兜底（雅虎在 IDC 段也常 429，最后一道保险）
+//
+// 东方财富 push2 字段说明：
+//   f43=最新价（按品种缩放：港股 ×100、外汇 ×10000、A股 ETF ×1000）
+//   f60=昨收（同缩放）
+//   f170=涨跌幅 ×100（即 -22 表示 -0.22%）
+//   不同 secid 前缀代表市场：1=沪、0=深、100=港股指数、133=外汇
 const SYMBOLS = {
-  CNH: { source: "sina_fx", code: "fx_susdcnh", yahoo: "CNH=X" },
-  HSI: { source: "tencent", code: "hkHSI", yahoo: "^HSI" },
-  HSTECH: { source: "tencent", code: "hkHSTECH", yahoo: "^HSTECH" },
-  "510300": { source: "tencent", code: "sh510300", yahoo: "510300.SS" },
-  "159915": { source: "tencent", code: "sz159915", yahoo: "159915.SZ" },
+  CNH: {
+    source: "sina_fx",
+    code: "fx_susdcnh",
+    eastmoney: { secid: "133.USDCNH", priceScale: 10000, pctScale: 100 },
+    yahoo: "CNH=X",
+  },
+  HSI: {
+    source: "tencent",
+    code: "hkHSI",
+    eastmoney: { secid: "100.HSI", priceScale: 100, pctScale: 100 },
+    yahoo: "^HSI",
+  },
+  HSTECH: {
+    source: "tencent",
+    code: "hkHSTECH",
+    eastmoney: null, // 东财没有公开 secid，主源失败时直接走雅虎
+    yahoo: "^HSTECH",
+  },
+  "510300": {
+    source: "tencent",
+    code: "sh510300",
+    eastmoney: { secid: "1.510300", priceScale: 1000, pctScale: 100 },
+    yahoo: "510300.SS",
+  },
+  "159915": {
+    source: "tencent",
+    code: "sz159915",
+    eastmoney: { secid: "0.159915", priceScale: 1000, pctScale: 100 },
+    yahoo: "159915.SZ",
+  },
 } as const;
 
 type SymbolKey = keyof typeof SYMBOLS;
@@ -105,6 +138,44 @@ async function fetchTencentLite(symbol: string, code: string): Promise<FetchedQu
   return { symbol, close_value: last, change_pct, trade_date };
 }
 
+// 东方财富 push2 备用源：sina/腾讯被 IDC 段屏蔽时（云服务器常见）能兜底。
+// 返回的字段都是放大整数：港股 ×100、外汇 ×10000、A 股 ETF ×1000、涨跌幅 ×100。
+async function fetchEastmoneyPush(
+  symbol: string,
+  cfg: { secid: string; priceScale: number; pctScale: number }
+): Promise<FetchedQuote | null> {
+  const url = `https://push2.eastmoney.com/api/qt/stock/get?secid=${encodeURIComponent(
+    cfg.secid
+  )}&fields=f43,f60,f170`;
+  const res = await fetchWithRetry(url, {
+    headers: { Referer: "https://quote.eastmoney.com/" },
+  });
+  if (!res.ok) return null;
+  let json: { rc?: number; data?: { f43?: number; f60?: number; f170?: number } | null };
+  try {
+    json = (await res.json()) as typeof json;
+  } catch {
+    return null;
+  }
+  const d = json?.data;
+  if (!d || d.f43 == null || d.f43 === 0) return null;
+  const last = d.f43 / cfg.priceScale;
+  const prev = d.f60 != null && d.f60 !== 0 ? d.f60 / cfg.priceScale : null;
+  const change_pct =
+    d.f170 != null && Number.isFinite(d.f170)
+      ? d.f170 / cfg.pctScale
+      : prev && prev > 0
+        ? ((last - prev) / prev) * 100
+        : null;
+  return {
+    symbol,
+    close_value: last,
+    change_pct,
+    trade_date: new Date().toISOString().slice(0, 10),
+    extra: { source: "eastmoney_push2", secid: cfg.secid },
+  };
+}
+
 // 雅虎财经备用源：境内境外均可达，结构化 JSON 自带 prev_close。
 // 适用所有 5 个外资代理 symbol，参考 https://query1.finance.yahoo.com/v8/finance/chart/<sym>
 async function fetchYahooQuote(yahooSymbol: string, displaySymbol: string): Promise<FetchedQuote | null> {
@@ -150,19 +221,18 @@ async function fetchYahooQuote(yahooSymbol: string, displaySymbol: string): Prom
 
 async function fetchOne(key: SymbolKey): Promise<FetchedQuote | null> {
   const spec = SYMBOLS[key];
-  // 主源
+  // 1) 主源（sina/腾讯）
   try {
     const primary =
       spec.source === "sina_fx"
         ? await fetchSinaFxCNH()
         : await fetchTencentLite(key, spec.code);
     if (primary) return primary;
-    // 主源返回 null（典型：sina IDC 屏蔽返回空字符串、腾讯境外阻塞），继续走 fallback
     logStage({
       stage: `external.primary_empty_${key}`,
       ok: false,
       primary: spec.source,
-      note: "fallback to yahoo",
+      note: "fallback to eastmoney",
     });
   } catch (e) {
     logStage({
@@ -172,7 +242,25 @@ async function fetchOne(key: SymbolKey): Promise<FetchedQuote | null> {
       error: e instanceof Error ? e.message : String(e),
     });
   }
-  // 雅虎降级
+  // 2) 东方财富 push2 降级
+  if (spec.eastmoney) {
+    try {
+      const em = await fetchEastmoneyPush(key, spec.eastmoney);
+      if (em) return em;
+      logStage({
+        stage: `external.eastmoney_empty_${key}`,
+        ok: false,
+        note: "fallback to yahoo",
+      });
+    } catch (e) {
+      logStage({
+        stage: `external.eastmoney_failed_${key}`,
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+  // 3) 雅虎降级
   try {
     const fallback = await fetchYahooQuote(spec.yahoo, key);
     if (fallback) return fallback;
