@@ -19,12 +19,14 @@ import { logStage } from "../utils/log.js";
  * 全部接口均为公开 + 免费 + 实时：失败时静默降级（写 0 条），不阻塞预测。
  */
 
+// 每个 symbol 配置主源（国内 IP 最稳）+ 雅虎降级源（境内境外都能访问）。
+// 主源失败（空字符串 / 5xx / 网络错）时自动 fallback 到雅虎，保证 IDC / 境外服务器上不开天窗。
 const SYMBOLS = {
-  CNH: { source: "sina_fx", code: "fx_susdcnh" },
-  HSI: { source: "tencent", code: "hkHSI" },
-  HSTECH: { source: "tencent", code: "hkHSTECH" },
-  "510300": { source: "tencent", code: "sh510300" }, // 沪深300 ETF
-  "159915": { source: "tencent", code: "sz159915" }, // 创业板 ETF
+  CNH: { source: "sina_fx", code: "fx_susdcnh", yahoo: "CNH=X" },
+  HSI: { source: "tencent", code: "hkHSI", yahoo: "^HSI" },
+  HSTECH: { source: "tencent", code: "hkHSTECH", yahoo: "^HSTECH" },
+  "510300": { source: "tencent", code: "sh510300", yahoo: "510300.SS" },
+  "159915": { source: "tencent", code: "sz159915", yahoo: "159915.SZ" },
 } as const;
 
 type SymbolKey = keyof typeof SYMBOLS;
@@ -103,19 +105,85 @@ async function fetchTencentLite(symbol: string, code: string): Promise<FetchedQu
   return { symbol, close_value: last, change_pct, trade_date };
 }
 
+// 雅虎财经备用源：境内境外均可达，结构化 JSON 自带 prev_close。
+// 适用所有 5 个外资代理 symbol，参考 https://query1.finance.yahoo.com/v8/finance/chart/<sym>
+async function fetchYahooQuote(yahooSymbol: string, displaySymbol: string): Promise<FetchedQuote | null> {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
+    yahooSymbol
+  )}?interval=1d&range=5d`;
+  const res = await fetchWithRetry(url);
+  if (!res.ok) return null;
+  const text = await res.text();
+  let json: {
+    chart?: {
+      result?: Array<{
+        meta?: {
+          regularMarketPrice?: number;
+          chartPreviousClose?: number;
+          regularMarketTime?: number;
+        };
+      }>;
+    };
+  };
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  const meta = json?.chart?.result?.[0]?.meta;
+  const last = meta?.regularMarketPrice;
+  if (!Number.isFinite(last) || !last || last === 0) return null;
+  const prev = meta?.chartPreviousClose;
+  const change_pct =
+    Number.isFinite(prev) && (prev ?? 0) > 0 ? ((last - (prev as number)) / (prev as number)) * 100 : null;
+  const tradeDate = Number.isFinite(meta?.regularMarketTime)
+    ? new Date((meta!.regularMarketTime as number) * 1000).toISOString().slice(0, 10)
+    : new Date().toISOString().slice(0, 10);
+  return {
+    symbol: displaySymbol,
+    close_value: last,
+    change_pct,
+    trade_date: tradeDate,
+    extra: { source: "yahoo", yahoo_symbol: yahooSymbol },
+  };
+}
+
 async function fetchOne(key: SymbolKey): Promise<FetchedQuote | null> {
   const spec = SYMBOLS[key];
+  // 主源
   try {
-    if (spec.source === "sina_fx") return await fetchSinaFxCNH();
-    return await fetchTencentLite(key, spec.code);
+    const primary =
+      spec.source === "sina_fx"
+        ? await fetchSinaFxCNH()
+        : await fetchTencentLite(key, spec.code);
+    if (primary) return primary;
+    // 主源返回 null（典型：sina IDC 屏蔽返回空字符串、腾讯境外阻塞），继续走 fallback
+    logStage({
+      stage: `external.primary_empty_${key}`,
+      ok: false,
+      primary: spec.source,
+      note: "fallback to yahoo",
+    });
   } catch (e) {
     logStage({
-      stage: `external.fetch_${key}_failed`,
+      stage: `external.primary_failed_${key}`,
+      ok: false,
+      primary: spec.source,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+  // 雅虎降级
+  try {
+    const fallback = await fetchYahooQuote(spec.yahoo, key);
+    if (fallback) return fallback;
+  } catch (e) {
+    logStage({
+      stage: `external.fallback_failed_${key}`,
       ok: false,
       error: e instanceof Error ? e.message : String(e),
     });
-    return null;
   }
+  return null;
 }
 
 export interface ExternalIngestResult {
