@@ -1014,15 +1014,23 @@ export function getExternalProxyInRange(start: string, end: string): ExternalPro
     .all(start, end) as ExternalProxyRow[];
 }
 
+// 每个 symbol 各取自己最新一日：
+// 不同代理交易时段不同（外汇 24h、港股至 16:00、A 股至 15:00），如果按全局 MAX(trade_date)
+// 过滤会导致后收盘的代理（A 股 ETF / 港股）被外汇 / 隔夜更新过的 CNH 抢前，只剩 1 条返回。
+// 真正符合直觉的语义是"展示每个代理的当前最新报价"，所以按 symbol 分组取各自的 MAX。
 export function getLatestExternalProxy(): ExternalProxyRow[] {
   const db = getDb();
-  const latest = db
-    .prepare("SELECT trade_date FROM external_proxy ORDER BY trade_date DESC LIMIT 1")
-    .get() as { trade_date: string } | undefined;
-  if (!latest) return [];
   return db
-    .prepare("SELECT * FROM external_proxy WHERE trade_date = ?")
-    .all(latest.trade_date) as ExternalProxyRow[];
+    .prepare(
+      `SELECT e.* FROM external_proxy e
+       INNER JOIN (
+         SELECT symbol, MAX(trade_date) AS md
+         FROM external_proxy
+         GROUP BY symbol
+       ) m ON e.symbol = m.symbol AND e.trade_date = m.md
+       ORDER BY e.symbol ASC`
+    )
+    .all() as ExternalProxyRow[];
 }
 
 // ==================== P1: 股指期货升贴水 CRUD ====================
@@ -1066,15 +1074,21 @@ export function upsertFuturesBasis(row: FuturesBasisRow): void {
   );
 }
 
+// 同 getLatestExternalProxy：按 contract 分组各取自己最新一日，避免某个合约因为
+// 入库时机跨日（如夜间 ingest 时被记成 T+1）而把其余合约一起从结果中挤掉。
 export function getLatestFuturesBasis(): FuturesBasisRow[] {
   const db = getDb();
-  const latest = db
-    .prepare("SELECT trade_date FROM futures_basis ORDER BY trade_date DESC LIMIT 1")
-    .get() as { trade_date: string } | undefined;
-  if (!latest) return [];
   return db
-    .prepare("SELECT * FROM futures_basis WHERE trade_date = ?")
-    .all(latest.trade_date) as FuturesBasisRow[];
+    .prepare(
+      `SELECT f.* FROM futures_basis f
+       INNER JOIN (
+         SELECT contract, MAX(trade_date) AS md
+         FROM futures_basis
+         GROUP BY contract
+       ) m ON f.contract = m.contract AND f.trade_date = m.md
+       ORDER BY f.contract ASC`
+    )
+    .all() as FuturesBasisRow[];
 }
 
 // ==================== P2: 预测回顾 CRUD ====================
