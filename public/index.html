@@ -122,7 +122,21 @@
     .card-predict .pred-pct { font-size: 18px; font-weight: 600; color: #555; }
     .card-predict .pred-pct.up { color: #c0392b; }
     .card-predict .pred-pct.down { color: #27ae60; }
+    .card-predict .pred-range {
+      font-size: 11px; color: #777; background: #fff;
+      border: 1px solid #e0e3ee; padding: 1px 6px; border-radius: 4px;
+    }
+    .card-predict .pred-bucket {
+      font-size: 11px; padding: 1px 8px; border-radius: 8px;
+      color: white; font-weight: 500;
+    }
+    .card-predict .pred-bucket.bucket-small { background: #95a5a6; }
+    .card-predict .pred-bucket.bucket-medium { background: #f39c12; }
+    .card-predict .pred-bucket.bucket-large { background: #e74c3c; }
     .card-predict .pred-conf { font-size: 11px; color: #999; }
+    .card-predict .pred-dims {
+      font-size: 11px; color: #667eea; font-family: SFMono-Regular, Menlo, monospace;
+    }
     .card-predict .pred-rationale { font-size: 11px; color: #888; line-height: 1.5; }
     .card-predict button.pred-refresh {
       align-self: flex-start; background: transparent; border: 1px solid #c7cce0;
@@ -156,6 +170,157 @@
       border-radius: 4px; padding: 3px 10px; margin-left: 6px;
       cursor: pointer; font-size: 12px;
     }
+
+    /* ========== 预测准确率 Tab 专属样式 ========== */
+    .acc-wrap { padding: 16px; flex: 1; overflow-y: auto; }
+    .acc-toolbar {
+      display: flex; gap: 12px; align-items: center; margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    .acc-toolbar label { font-size: 13px; color: #555; }
+    .acc-toolbar select, .acc-toolbar button {
+      padding: 6px 10px; border-radius: 6px; border: 1px solid #ddd;
+      font-size: 13px; cursor: pointer; background: white;
+    }
+    .acc-toolbar button {
+      background: linear-gradient(135deg, #667eea, #764ba2); color: white;
+      border: none;
+    }
+    .acc-toolbar button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .acc-stats {
+      display: grid; gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      margin-bottom: 20px;
+    }
+    .acc-stat-card {
+      background: white; border-radius: 10px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+      padding: 14px 16px;
+    }
+    .acc-stat-name { font-size: 14px; color: #555; font-weight: 500; margin-bottom: 10px; }
+    .acc-stat-row {
+      display: flex; justify-content: space-between; align-items: baseline;
+      font-size: 13px; color: #666; margin-bottom: 6px;
+    }
+    .acc-stat-row b {
+      font-family: SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 16px; color: #333; font-weight: 600;
+    }
+    .acc-stat-row b.good { color: #27ae60; }
+    .acc-stat-row b.bad { color: #c0392b; }
+    .acc-reviews-table-wrap {
+      background: white; border-radius: 10px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+      padding: 12px; overflow-x: auto;
+    }
+    .acc-reviews-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .acc-reviews-table thead th {
+      background: #fafbfd; color: #666; font-weight: 500;
+      text-align: right; padding: 8px 10px; border-bottom: 1px solid #eee;
+      font-family: SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .acc-reviews-table thead th:first-child,
+    .acc-reviews-table thead th:nth-child(2) { text-align: left; }
+    .acc-reviews-table tbody td {
+      padding: 6px 10px; text-align: right; border-bottom: 1px solid #f5f5f5;
+      font-family: SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .acc-reviews-table tbody td:first-child,
+    .acc-reviews-table tbody td:nth-child(2) { text-align: left; color: #555; }
+    .acc-reviews-table td.hit { color: #27ae60; }
+    .acc-reviews-table td.miss { color: #c0392b; }
+    .acc-reviews-table td.up { color: #c0392b; }
+    .acc-reviews-table td.down { color: #27ae60; }
+
+    /* ========== 多信号面板 Tab 样式 ========== */
+    .sig-wrap { padding: 16px; flex: 1; overflow-y: auto; }
+    .sig-toolbar {
+      display: flex; gap: 12px; align-items: center; margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    .sig-toolbar button {
+      padding: 6px 12px; border-radius: 6px; border: none;
+      background: linear-gradient(135deg, #667eea, #764ba2); color: white;
+      font-size: 13px; cursor: pointer;
+    }
+    .sig-toolbar button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .sig-toolbar button.secondary {
+      background: white; border: 1px solid #ddd; color: #555;
+    }
+    .sig-toolbar .sig-asof {
+      font-size: 13px; color: #888; font-family: SFMono-Regular, Menlo, monospace;
+    }
+    .sig-grid {
+      display: grid; gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+    }
+    .sig-card {
+      background: white; border-radius: 12px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+      padding: 14px 16px; display: flex; flex-direction: column; gap: 10px;
+      min-width: 0;
+    }
+    .sig-card-title {
+      font-size: 14px; font-weight: 600; color: #333;
+      border-bottom: 1px solid #f0f0f0; padding-bottom: 8px;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .sig-card-title .sig-card-hint {
+      font-size: 11px; color: #888; font-weight: 400;
+    }
+    .sig-card-body { font-size: 12px; color: #555; line-height: 1.6; }
+    .sig-card-body .sig-empty { color: #aaa; padding: 12px; text-align: center; }
+    .sig-row { display: flex; justify-content: space-between; padding: 2px 0; }
+    .sig-row b {
+      font-family: SFMono-Regular, Menlo, Consolas, monospace;
+      font-weight: 500; color: #333;
+    }
+    .sig-row b.up { color: #c0392b; }
+    .sig-row b.down { color: #27ae60; }
+    .sig-mini-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .sig-mini-table thead th {
+      background: #fafbfd; color: #666; font-weight: 500;
+      padding: 6px 8px; text-align: right; border-bottom: 1px solid #eee;
+      font-family: SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .sig-mini-table thead th:first-child { text-align: left; }
+    .sig-mini-table tbody td {
+      padding: 5px 8px; text-align: right; border-bottom: 1px solid #f5f5f5;
+      font-family: SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .sig-mini-table tbody td:first-child { text-align: left; color: #555; }
+    .sig-mini-table td.up { color: #c0392b; }
+    .sig-mini-table td.down { color: #27ae60; }
+    .sig-tag {
+      display: inline-block; padding: 1px 8px; border-radius: 8px;
+      font-size: 11px; color: white;
+    }
+    .sig-tag.up { background: #c0392b; }
+    .sig-tag.down { background: #27ae60; }
+    .sig-tag.neutral { background: #95a5a6; }
+    .sig-tag.imp-3 { background: #e74c3c; }
+    .sig-tag.imp-2 { background: #f39c12; }
+    .sig-tag.imp-1 { background: #95a5a6; }
+    .sig-event-list { display: flex; flex-direction: column; gap: 6px; }
+    .sig-event {
+      display: grid; grid-template-columns: 88px 36px 1fr; gap: 8px;
+      padding: 4px 0; border-bottom: 1px dashed #f0f0f0; align-items: baseline;
+    }
+    .sig-event .sig-event-date {
+      font-family: SFMono-Regular, Menlo, monospace; font-size: 11px; color: #777;
+    }
+    .sig-event .sig-event-name { font-size: 12px; color: #444; }
+    .sig-event .sig-event-rel { font-size: 11px; color: #aaa; margin-left: 4px; }
+    .sig-event .sig-event-meta { font-size: 11px; color: #888; }
+    .sig-news-item {
+      padding: 5px 0; border-bottom: 1px dashed #f0f0f0;
+      display: flex; flex-direction: column; gap: 3px;
+    }
+    .sig-news-item .sig-news-head {
+      display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+    }
+    .sig-news-item .sig-news-title { font-size: 12px; color: #333; }
+    .sig-news-item .sig-news-rationale { font-size: 11px; color: #888; }
   </style>
 </head>
 <body>
@@ -169,6 +334,8 @@
   <nav class="tabs">
     <button class="tab" data-tab="chat">智能咨询</button>
     <button class="tab" data-tab="stock">大盘指数</button>
+    <button class="tab" data-tab="signals">多信号面板</button>
+    <button class="tab" data-tab="accuracy">预测准确率</button>
   </nav>
 
   <main>
@@ -197,19 +364,33 @@
 
     <!-- 大盘指数 Tab -->
     <section class="panel" data-panel="stock"></section>
+
+    <!-- 多信号面板 Tab -->
+    <section class="panel" data-panel="signals"></section>
+
+    <!-- 预测准确率 Tab -->
+    <section class="panel" data-panel="accuracy"></section>
   </main>
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <script src="/common.js"></script>
   <script src="/chat.js"></script>
   <script src="/stock.js"></script>
+  <script src="/signals.js"></script>
+  <script src="/accuracy.js"></script>
   <script>
-    // 把 Tab 切换与 stock 模块的激活/暂停钩起来：
+    // 把 Tab 切换与各模块的激活/暂停钩起来：
     window.AppCommon.setupTabs(function (name) {
       if (name === "stock") {
         window.StockTab && window.StockTab.onActivate();
       } else {
         window.StockTab && window.StockTab.onDeactivate();
+      }
+      if (name === "signals") {
+        window.SignalsTab && window.SignalsTab.onActivate();
+      }
+      if (name === "accuracy") {
+        window.AccuracyTab && window.AccuracyTab.onActivate();
       }
     });
   </script>

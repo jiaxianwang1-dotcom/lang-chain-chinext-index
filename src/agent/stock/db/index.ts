@@ -22,6 +22,14 @@ const QUOTE_OHLCV_COLUMNS: Array<[string, string]> = [
   ["turnover", "REAL"], // 成交额（元）
 ];
 
+const PREDICTION_EXTRA_COLUMNS: Array<[string, string]> = [
+  ["predicted_change_pct_low", "REAL"],
+  ["predicted_change_pct_high", "REAL"],
+  ["magnitude_bucket", "TEXT"], // "small" | "medium" | "large"
+  ["dimensions_used", "INTEGER"],
+  ["signals_json", "TEXT"],
+];
+
 function ensureColumn(db: Database.Database, table: string, col: string, def: string): void {
   const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
   if (!rows.some((r) => r.name === col)) {
@@ -32,6 +40,9 @@ function ensureColumn(db: Database.Database, table: string, col: string, def: st
 function applyMigrations(db: Database.Database): void {
   for (const [col, def] of QUOTE_OHLCV_COLUMNS) {
     ensureColumn(db, "index_quotes", col, def);
+  }
+  for (const [col, def] of PREDICTION_EXTRA_COLUMNS) {
+    ensureColumn(db, "index_predictions", col, def);
   }
 }
 
@@ -177,6 +188,69 @@ export function getDb(): Database.Database {
       UNIQUE(index_code, target_date)
     );
     CREATE INDEX IF NOT EXISTS idx_predictions_code_date ON index_predictions(index_code, target_date DESC);
+
+    -- ============ P1：宏观日历（手动 + 启发式种子） ============
+    CREATE TABLE IF NOT EXISTS macro_calendar (
+      event_date  TEXT NOT NULL,           -- YYYY-MM-DD
+      event_code  TEXT NOT NULL,           -- 唯一标识，如 'cpi-2026-05'
+      event_name  TEXT NOT NULL,           -- 中文事件名
+      importance  INTEGER NOT NULL,        -- 1=低 2=中 3=高
+      country     TEXT,                    -- 'CN' / 'US' / 'OTHER'
+      expectation TEXT,                    -- 市场预期（可空）
+      actual      TEXT,                    -- 实际值（事件发生后可补）
+      notes       TEXT,
+      created_at  TEXT NOT NULL,
+      updated_at  TEXT NOT NULL,
+      PRIMARY KEY (event_date, event_code)
+    );
+    CREATE INDEX IF NOT EXISTS idx_macro_date ON macro_calendar(event_date);
+
+    -- ============ P1：外资情绪代理（CNH / 恒指 / 沪深300 ETF） ============
+    CREATE TABLE IF NOT EXISTS external_proxy (
+      trade_date    TEXT NOT NULL,
+      symbol        TEXT NOT NULL,          -- 'CNH' / 'HSI' / 'HSTECH' / '510300' / '159915'
+      close_value   REAL,
+      change_pct    REAL,                   -- 当日相对前日 %
+      extra_json    TEXT,
+      created_at    TEXT NOT NULL,
+      updated_at    TEXT NOT NULL,
+      PRIMARY KEY (trade_date, symbol)
+    );
+    CREATE INDEX IF NOT EXISTS idx_external_date ON external_proxy(trade_date DESC, symbol);
+
+    -- ============ P1：股指期货升贴水（IF/IH/IC/IM 当月合约） ============
+    CREATE TABLE IF NOT EXISTS futures_basis (
+      trade_date     TEXT NOT NULL,
+      contract       TEXT NOT NULL,         -- 'IF' / 'IH' / 'IC' / 'IM'
+      contract_code  TEXT,                  -- 实际主力合约代码，如 IF2506
+      futures_close  REAL,                  -- 当月合约收盘
+      spot_close     REAL,                  -- 对应现货指数收盘
+      basis          REAL,                  -- 升贴水 = futures - spot（带符号）
+      basis_pct      REAL,                  -- basis / spot * 100，%
+      created_at     TEXT NOT NULL,
+      updated_at     TEXT NOT NULL,
+      PRIMARY KEY (trade_date, contract)
+    );
+    CREATE INDEX IF NOT EXISTS idx_futures_date ON futures_basis(trade_date DESC, contract);
+
+    -- ============ P2：预测回顾（按 (index_code, target_date) 唯一） ============
+    CREATE TABLE IF NOT EXISTS prediction_review (
+      index_code        TEXT NOT NULL,
+      target_date       TEXT NOT NULL,
+      predicted_pct     REAL,               -- 预测涨跌幅 %
+      predicted_direction TEXT,             -- "up" / "down"
+      predicted_low     REAL,               -- 预测区间下界 %
+      predicted_high    REAL,               -- 预测区间上界 %
+      confidence        REAL,
+      actual_pct        REAL,               -- 实际涨跌幅 %
+      actual_direction  TEXT,
+      direction_hit     INTEGER,            -- 1=方向命中 / 0=不命中
+      range_hit         INTEGER,            -- 1=区间命中 / 0=未命中（缺区间则 NULL）
+      pct_abs_error     REAL,               -- |actual - predicted| %
+      reviewed_at       TEXT NOT NULL,
+      PRIMARY KEY (index_code, target_date)
+    );
+    CREATE INDEX IF NOT EXISTS idx_review_code_date ON prediction_review(index_code, target_date DESC);
   `);
 
   // 给已经存在的 index_quotes 表补齐 OHLCV 列（向前迁移，幂等）
@@ -719,6 +793,8 @@ export function getNewsByDate(date: string, limit = 20): NewsEventRow[] {
 
 // ==================== AI 涨跌幅预测 CRUD ====================
 
+export type MagnitudeBucket = "small" | "medium" | "large";
+
 export interface IndexPredictionRow {
   id?: number;
   index_code: string;
@@ -730,6 +806,16 @@ export interface IndexPredictionRow {
   model: string | null;
   based_on_date: string | null;
   predicted_at: string;
+  /** P0：区间下界（带符号 %）。例如预测 +0.85%，可能给区间 [+0.3, +1.4]。*/
+  predicted_change_pct_low?: number | null;
+  /** P0：区间上界（带符号 %）。*/
+  predicted_change_pct_high?: number | null;
+  /** P0：幅度档位。小幅<0.5% / 中幅 0.5~1.5% / 大幅>=1.5%。*/
+  magnitude_bucket?: MagnitudeBucket | null;
+  /** P0：实际入 prompt 的维度数（满分 10）。*/
+  dimensions_used?: number | null;
+  /** P0：每维度倾向 JSON，如 {trend:"up", volume:"down", ...}。*/
+  signals_json?: string | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -751,6 +837,11 @@ export function upsertPrediction(row: IndexPredictionRow): IndexPredictionRow {
            model = ?,
            based_on_date = ?,
            predicted_at = ?,
+           predicted_change_pct_low = ?,
+           predicted_change_pct_high = ?,
+           magnitude_bucket = ?,
+           dimensions_used = ?,
+           signals_json = ?,
            updated_at = ?
        WHERE id = ?`
     ).run(
@@ -761,6 +852,11 @@ export function upsertPrediction(row: IndexPredictionRow): IndexPredictionRow {
       row.model,
       row.based_on_date,
       row.predicted_at,
+      row.predicted_change_pct_low ?? null,
+      row.predicted_change_pct_high ?? null,
+      row.magnitude_bucket ?? null,
+      row.dimensions_used ?? null,
+      row.signals_json ?? null,
       now,
       existing.id
     );
@@ -771,8 +867,11 @@ export function upsertPrediction(row: IndexPredictionRow): IndexPredictionRow {
     .prepare(
       `INSERT INTO index_predictions
        (index_code, target_date, predicted_change_pct, direction, confidence,
-        rationale, model, based_on_date, predicted_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        rationale, model, based_on_date, predicted_at,
+        predicted_change_pct_low, predicted_change_pct_high,
+        magnitude_bucket, dimensions_used, signals_json,
+        created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       row.index_code,
@@ -784,6 +883,11 @@ export function upsertPrediction(row: IndexPredictionRow): IndexPredictionRow {
       row.model,
       row.based_on_date,
       row.predicted_at,
+      row.predicted_change_pct_low ?? null,
+      row.predicted_change_pct_high ?? null,
+      row.magnitude_bucket ?? null,
+      row.dimensions_used ?? null,
+      row.signals_json ?? null,
       now,
       now
     );
@@ -811,6 +915,245 @@ export function getPredictionsInRange(
        ORDER BY target_date ASC`
     )
     .all(indexCode, startDate, endDate) as IndexPredictionRow[];
+}
+
+// ==================== P1: 宏观日历 CRUD ====================
+
+export interface MacroCalendarRow {
+  event_date: string;
+  event_code: string;
+  event_name: string;
+  importance: 1 | 2 | 3;
+  country: string | null;
+  expectation: string | null;
+  actual: string | null;
+  notes: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export function upsertMacroEvent(row: MacroCalendarRow): void {
+  const db = getDb();
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO macro_calendar
+     (event_date, event_code, event_name, importance, country, expectation, actual, notes, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(event_date, event_code) DO UPDATE SET
+       event_name=excluded.event_name,
+       importance=excluded.importance,
+       country=excluded.country,
+       expectation=COALESCE(excluded.expectation, macro_calendar.expectation),
+       actual=COALESCE(excluded.actual, macro_calendar.actual),
+       notes=COALESCE(excluded.notes, macro_calendar.notes),
+       updated_at=excluded.updated_at`
+  ).run(
+    row.event_date,
+    row.event_code,
+    row.event_name,
+    row.importance,
+    row.country,
+    row.expectation,
+    row.actual,
+    row.notes,
+    now,
+    now
+  );
+}
+
+export function getMacroEventsInRange(start: string, end: string): MacroCalendarRow[] {
+  const db = getDb();
+  return db
+    .prepare(
+      "SELECT * FROM macro_calendar WHERE event_date >= ? AND event_date <= ? ORDER BY event_date ASC, importance DESC"
+    )
+    .all(start, end) as MacroCalendarRow[];
+}
+
+// ==================== P1: 外资情绪代理 CRUD ====================
+
+export interface ExternalProxyRow {
+  trade_date: string;
+  symbol: string;
+  close_value: number | null;
+  change_pct: number | null;
+  extra_json: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export function upsertExternalProxy(row: ExternalProxyRow): void {
+  const db = getDb();
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO external_proxy
+     (trade_date, symbol, close_value, change_pct, extra_json, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?)
+     ON CONFLICT(trade_date, symbol) DO UPDATE SET
+       close_value=excluded.close_value,
+       change_pct=excluded.change_pct,
+       extra_json=COALESCE(excluded.extra_json, external_proxy.extra_json),
+       updated_at=excluded.updated_at`
+  ).run(
+    row.trade_date,
+    row.symbol,
+    row.close_value,
+    row.change_pct,
+    row.extra_json,
+    now,
+    now
+  );
+}
+
+export function getExternalProxyInRange(start: string, end: string): ExternalProxyRow[] {
+  const db = getDb();
+  return db
+    .prepare(
+      "SELECT * FROM external_proxy WHERE trade_date >= ? AND trade_date <= ? ORDER BY trade_date ASC, symbol ASC"
+    )
+    .all(start, end) as ExternalProxyRow[];
+}
+
+export function getLatestExternalProxy(): ExternalProxyRow[] {
+  const db = getDb();
+  const latest = db
+    .prepare("SELECT trade_date FROM external_proxy ORDER BY trade_date DESC LIMIT 1")
+    .get() as { trade_date: string } | undefined;
+  if (!latest) return [];
+  return db
+    .prepare("SELECT * FROM external_proxy WHERE trade_date = ?")
+    .all(latest.trade_date) as ExternalProxyRow[];
+}
+
+// ==================== P1: 股指期货升贴水 CRUD ====================
+
+export interface FuturesBasisRow {
+  trade_date: string;
+  contract: string; // "IF" | "IH" | "IC" | "IM"
+  contract_code: string | null;
+  futures_close: number | null;
+  spot_close: number | null;
+  basis: number | null;
+  basis_pct: number | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export function upsertFuturesBasis(row: FuturesBasisRow): void {
+  const db = getDb();
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO futures_basis
+     (trade_date, contract, contract_code, futures_close, spot_close, basis, basis_pct, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(trade_date, contract) DO UPDATE SET
+       contract_code=excluded.contract_code,
+       futures_close=excluded.futures_close,
+       spot_close=excluded.spot_close,
+       basis=excluded.basis,
+       basis_pct=excluded.basis_pct,
+       updated_at=excluded.updated_at`
+  ).run(
+    row.trade_date,
+    row.contract,
+    row.contract_code,
+    row.futures_close,
+    row.spot_close,
+    row.basis,
+    row.basis_pct,
+    now,
+    now
+  );
+}
+
+export function getLatestFuturesBasis(): FuturesBasisRow[] {
+  const db = getDb();
+  const latest = db
+    .prepare("SELECT trade_date FROM futures_basis ORDER BY trade_date DESC LIMIT 1")
+    .get() as { trade_date: string } | undefined;
+  if (!latest) return [];
+  return db
+    .prepare("SELECT * FROM futures_basis WHERE trade_date = ?")
+    .all(latest.trade_date) as FuturesBasisRow[];
+}
+
+// ==================== P2: 预测回顾 CRUD ====================
+
+export interface PredictionReviewRow {
+  index_code: string;
+  target_date: string;
+  predicted_pct: number | null;
+  predicted_direction: "up" | "down" | null;
+  predicted_low: number | null;
+  predicted_high: number | null;
+  confidence: number | null;
+  actual_pct: number | null;
+  actual_direction: "up" | "down" | null;
+  direction_hit: 0 | 1 | null;
+  range_hit: 0 | 1 | null;
+  pct_abs_error: number | null;
+  reviewed_at: string;
+}
+
+export function upsertReview(row: PredictionReviewRow): void {
+  const db = getDb();
+  db.prepare(
+    `INSERT INTO prediction_review
+     (index_code, target_date, predicted_pct, predicted_direction,
+      predicted_low, predicted_high, confidence,
+      actual_pct, actual_direction, direction_hit, range_hit, pct_abs_error, reviewed_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(index_code, target_date) DO UPDATE SET
+       predicted_pct=excluded.predicted_pct,
+       predicted_direction=excluded.predicted_direction,
+       predicted_low=excluded.predicted_low,
+       predicted_high=excluded.predicted_high,
+       confidence=excluded.confidence,
+       actual_pct=excluded.actual_pct,
+       actual_direction=excluded.actual_direction,
+       direction_hit=excluded.direction_hit,
+       range_hit=excluded.range_hit,
+       pct_abs_error=excluded.pct_abs_error,
+       reviewed_at=excluded.reviewed_at`
+  ).run(
+    row.index_code,
+    row.target_date,
+    row.predicted_pct,
+    row.predicted_direction,
+    row.predicted_low,
+    row.predicted_high,
+    row.confidence,
+    row.actual_pct,
+    row.actual_direction,
+    row.direction_hit,
+    row.range_hit,
+    row.pct_abs_error,
+    row.reviewed_at
+  );
+}
+
+export function getReviewsInRange(
+  indexCode: string,
+  startDate: string,
+  endDate: string
+): PredictionReviewRow[] {
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT * FROM prediction_review
+       WHERE index_code = ? AND target_date >= ? AND target_date <= ?
+       ORDER BY target_date ASC`
+    )
+    .all(indexCode, startDate, endDate) as PredictionReviewRow[];
+}
+
+export function getReview(indexCode: string, targetDate: string): PredictionReviewRow | null {
+  const db = getDb();
+  return (
+    (db
+      .prepare("SELECT * FROM prediction_review WHERE index_code = ? AND target_date = ?")
+      .get(indexCode, targetDate) as PredictionReviewRow | undefined) ?? null
+  );
 }
 
 // ==================== 测试辅助 ====================
@@ -903,7 +1246,37 @@ export function openDbForTest(path: string): Database.Database {
       predicted_change_pct REAL, direction TEXT, confidence REAL, rationale TEXT,
       model TEXT, based_on_date TEXT,
       predicted_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      predicted_change_pct_low REAL, predicted_change_pct_high REAL,
+      magnitude_bucket TEXT, dimensions_used INTEGER, signals_json TEXT,
       UNIQUE(index_code, target_date)
+    );
+
+    CREATE TABLE IF NOT EXISTS macro_calendar (
+      event_date TEXT NOT NULL, event_code TEXT NOT NULL, event_name TEXT NOT NULL,
+      importance INTEGER NOT NULL, country TEXT, expectation TEXT, actual TEXT, notes TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      PRIMARY KEY (event_date, event_code)
+    );
+    CREATE TABLE IF NOT EXISTS external_proxy (
+      trade_date TEXT NOT NULL, symbol TEXT NOT NULL,
+      close_value REAL, change_pct REAL, extra_json TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      PRIMARY KEY (trade_date, symbol)
+    );
+    CREATE TABLE IF NOT EXISTS futures_basis (
+      trade_date TEXT NOT NULL, contract TEXT NOT NULL, contract_code TEXT,
+      futures_close REAL, spot_close REAL, basis REAL, basis_pct REAL,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      PRIMARY KEY (trade_date, contract)
+    );
+    CREATE TABLE IF NOT EXISTS prediction_review (
+      index_code TEXT NOT NULL, target_date TEXT NOT NULL,
+      predicted_pct REAL, predicted_direction TEXT,
+      predicted_low REAL, predicted_high REAL, confidence REAL,
+      actual_pct REAL, actual_direction TEXT,
+      direction_hit INTEGER, range_hit INTEGER, pct_abs_error REAL,
+      reviewed_at TEXT NOT NULL,
+      PRIMARY KEY (index_code, target_date)
     );
   `);
   return db;

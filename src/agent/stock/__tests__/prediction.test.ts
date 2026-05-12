@@ -226,7 +226,7 @@ describe("predictNextTradingDay (multi-signal 多维度模式 默认)", () => {
 
     const stored = getLatestMemory("000001.SH");
     const f = JSON.parse(stored!.features);
-    expect(f.last_prediction.mode).toBe("multi-signal-30d");
+    expect(f.last_prediction.mode).toBe("multi-signal-v2");
     expect(f.last_prediction.signals).toBeDefined();
     expect(f.last_prediction.dimensions_used).toBeGreaterThanOrEqual(2);
   });
@@ -251,8 +251,9 @@ describe("predictNextTradingDay (multi-signal 多维度模式 默认)", () => {
         }),
     });
     expect(r.direction).toBe("down");
-    // 测试库里没 margin/breadth/sector/news/lhb，dimensions = trend+volume = 2
-    expect(r.dimensions_used).toBe(2);
+    // 测试库里没 margin/breadth/sector/news/lhb/external/futures，
+    // 但 macro 维度有启发式种子，因此 dimensions = trend + volume + macro = 3
+    expect(r.dimensions_used).toBe(3);
   });
 });
 

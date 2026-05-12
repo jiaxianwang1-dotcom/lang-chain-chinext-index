@@ -34,11 +34,31 @@ import {
   getLatestSectorRotation,
   getNewsByDate,
   getPredictionsInRange,
+  getLatestExternalProxy,
+  getExternalProxyInRange,
+  getLatestFuturesBasis,
+  getMacroEventsInRange,
+  type ExternalProxyRow,
+  type MacroCalendarRow,
 } from "./src/agent/stock/db/index.js";
+import { ensureRecentMacroSeed } from "./src/agent/stock/providers/macro.js";
+import { ingestExternalProxies } from "./src/agent/stock/providers/external.js";
+import { ingestFuturesBasis } from "./src/agent/stock/providers/futures.js";
+import { ingestLhb } from "./src/agent/stock/providers/lhb.js";
+import { ingestMarketBreadth } from "./src/agent/stock/providers/breadth.js";
+import { ingestSectorRotation } from "./src/agent/stock/providers/sector.js";
+import { ingestLatestMargin } from "./src/agent/stock/providers/margin.js";
+import { ingestToday } from "./src/agent/stock/providers/ingestion.js";
 import {
   predictChangePctForTarget,
   decideCardTarget,
 } from "./src/agent/stock/prediction/realtime-card.js";
+import {
+  computeAllAccuracy,
+  computeAccuracy,
+  reviewRecentPredictions,
+} from "./src/agent/stock/review/index.js";
+import { getReviewsInRange } from "./src/agent/stock/db/index.js";
 import { listTargetIndexes, findIndexMeta } from "./src/agent/stock/providers/index.js";
 import { predictAllTargets, predictNextTradingDay } from "./src/agent/stock/prediction/index.js";
 import { getLhbActivity, getLhbForIndex } from "./src/agent/stock/providers/lhb.js";
@@ -1091,6 +1111,355 @@ app.get("/api/stock/predictions/card", async (req, res) => {
       error: e instanceof Error ? e.message : String(e),
     });
     res.status(502).json({ error: "predict failed", message: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// ==================== AI 预测准确率（P2-7）====================
+//
+// - GET /api/stock/accuracy        汇总：方向命中率 / 区间命中率 / 平均绝对误差 MAE。可选 indexCode + days。
+// - GET /api/stock/reviews         明细：列出 [start, end] 区间内每一条预测 vs 实际。
+// - POST /api/stock/reviews/refresh 触发一次盘后回顾（默认回顾近 90 天）。
+
+function parseDaysQuery(req: express.Request, fallback = 30): { start: string; end: string; days: number } {
+  const daysRaw = Number(req.query.days ?? fallback);
+  const days = Number.isFinite(daysRaw) && daysRaw > 0 ? Math.min(365, daysRaw) : fallback;
+  const end = new Date();
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - days);
+  return { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10), days };
+}
+
+app.get("/api/stock/accuracy", (req, res) => {
+  const { start, end, days } = parseDaysQuery(req, 30);
+  const indexCode = (req.query.indexCode as string | undefined) ?? undefined;
+  try {
+    if (indexCode) {
+      const meta = findIndexMeta(indexCode);
+      if (!meta) {
+        res.status(400).json({ error: "unsupported indexCode" });
+        return;
+      }
+      res.json({ start, end, days, stats: [computeAccuracy(indexCode, start, end)] });
+      return;
+    }
+    res.json({ start, end, days, stats: computeAllAccuracy(start, end) });
+  } catch (e) {
+    logStage({
+      stage: "accuracy.failed",
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    res.status(500).json({ error: "accuracy compute failed" });
+  }
+});
+
+app.get("/api/stock/reviews", (req, res) => {
+  const indexCode = String(req.query.indexCode ?? "");
+  const meta = findIndexMeta(indexCode);
+  if (!meta) {
+    res.status(400).json({ error: "unsupported indexCode" });
+    return;
+  }
+  const { start, end, days } = parseDaysQuery(req, 30);
+  try {
+    const rows = getReviewsInRange(indexCode, start, end);
+    res.json({
+      indexCode,
+      indexName: meta.index_name,
+      start,
+      end,
+      days,
+      rows,
+    });
+  } catch (e) {
+    logStage({
+      stage: "reviews.failed",
+      ok: false,
+      indexCode,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    res.status(500).json({ error: "reviews query failed" });
+  }
+});
+
+// ==================== 多信号面板（P1 数据可视化）====================
+//
+// 把后端入库的所有多信号数据都暴露给前端，纯只读 JSON。
+// - GET /api/stock/signals      一次性返回 7 大类聚合数据
+// - GET /api/stock/macro        宏观日历（近邻 / 自定义窗口）
+// - GET /api/stock/external     外资代理（最新一日 + CNH 近 7 日序列）
+// - GET /api/stock/futures      股指期货升贴水（最新一日）
+// - POST /api/stock/signals/refresh 触发实时 ingest（macro 种子 / external / futures）
+
+function daysAround(asOf: string, before: number, after: number): { start: string; end: string } {
+  const d = new Date(asOf);
+  const past = new Date(d);
+  past.setUTCDate(past.getUTCDate() - before);
+  const fwd = new Date(d);
+  fwd.setUTCDate(fwd.getUTCDate() + after);
+  return { start: past.toISOString().slice(0, 10), end: fwd.toISOString().slice(0, 10) };
+}
+
+interface SignalsPayload {
+  asOfDate: string;
+  macro: MacroCalendarRow[];
+  external: {
+    latest: ExternalProxyRow[];
+    cnhRecent: ExternalProxyRow[];
+  };
+  futures: ReturnType<typeof getLatestFuturesBasis>;
+  margin: ReturnType<typeof getMarginInRange>;
+  breadth: ReturnType<typeof getBreadthInRange>;
+  sector: ReturnType<typeof getLatestSectorRotation>;
+  lhb: ReturnType<typeof getLhbActivity>;
+  news: ReturnType<typeof getNewsByDate>;
+}
+
+app.get("/api/stock/signals", (_req, res) => {
+  try {
+    const sse = getLatestQuote("000001.SH");
+    const asOfDate = sse?.trade_date ?? new Date().toISOString().slice(0, 10);
+
+    // 宏观：近 7 天 / 后 5 天
+    try {
+      ensureRecentMacroSeed(asOfDate);
+    } catch {
+      /* 启发式种子失败不阻塞读取 */
+    }
+    const macroRange = daysAround(asOfDate, 7, 5);
+    const macro = getMacroEventsInRange(macroRange.start, macroRange.end);
+
+    // 外资：最新一日 + CNH 近 7 自然日序列
+    const latest = getLatestExternalProxy();
+    const cnhRange = daysAround(asOfDate, 7, 0);
+    const cnhRecent = getExternalProxyInRange(cnhRange.start, cnhRange.end).filter(
+      (r) => r.symbol === "CNH"
+    );
+
+    // 期货
+    const futures = getLatestFuturesBasis();
+
+    // 资金面：取近 30 自然日数据（保证含长假期 + 周末后仍有 >= 10 个交易日可看）
+    // margin 是 T+1 数据，前端只展示尾部 7 条。
+    const marginRange = daysAround(asOfDate, 30, 0);
+    const margin = getMarginInRange(marginRange.start, marginRange.end);
+
+    // 广度：近 10 自然日 → 拿到最近 5 个交易日
+    const breadthRange = daysAround(asOfDate, 10, 0);
+    const breadth = getBreadthInRange(breadthRange.start, breadthRange.end);
+
+    // 板块（最近一日）
+    const sector = getLatestSectorRotation();
+
+    // 龙虎榜（最近一日，按 |净额| 排序）
+    let lhb: ReturnType<typeof getLhbActivity> | null = null;
+    try {
+      lhb = getLhbActivity(asOfDate);
+    } catch {
+      lhb = { trade_date: asOfDate, total_count: 0, net_buy_total: 0, net_sell_total: 0, top_3_by_net_amount: [] };
+    }
+
+    // 当日已分类新闻事件（前 15 条）
+    const news = getNewsByDate(asOfDate, 15);
+
+    const payload: SignalsPayload = {
+      asOfDate,
+      macro,
+      external: { latest, cnhRecent },
+      futures,
+      margin,
+      breadth,
+      sector,
+      lhb: lhb ?? { trade_date: asOfDate, total_count: 0, net_buy_total: 0, net_sell_total: 0, top_3_by_net_amount: [] },
+      news,
+    };
+    res.json(payload);
+  } catch (e) {
+    logStage({
+      stage: "signals.failed",
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    res.status(500).json({ error: "signals query failed" });
+  }
+});
+
+app.get("/api/stock/macro", (req, res) => {
+  const today = todayShanghai();
+  const start = (req.query.start as string | undefined) ?? daysAround(today, 7, 0).start;
+  const end = (req.query.end as string | undefined) ?? daysAround(today, 0, 14).end;
+  try {
+    try {
+      ensureRecentMacroSeed(today);
+    } catch {
+      /* 启发式失败不阻塞 */
+    }
+    const rows = getMacroEventsInRange(start, end);
+    res.json({ start, end, rows });
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+app.get("/api/stock/external", (_req, res) => {
+  try {
+    const latest = getLatestExternalProxy();
+    const asOf = latest[0]?.trade_date ?? new Date().toISOString().slice(0, 10);
+    const range = daysAround(asOf, 7, 0);
+    const cnhRecent = getExternalProxyInRange(range.start, range.end).filter(
+      (r) => r.symbol === "CNH"
+    );
+    res.json({ asOfDate: asOf, latest, cnhRecent });
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+app.get("/api/stock/futures", (_req, res) => {
+  try {
+    const rows = getLatestFuturesBasis();
+    res.json({ asOfDate: rows[0]?.trade_date ?? null, rows });
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// 实时触发采集：把"目前能拉到的数据"一次拉齐。返回采集结果以便前端 toast。
+//
+// 触发的维度：
+// - quote     上证/创业板今日 OHLCV（决定面板 asOfDate）
+// - breadth   涨跌平 + 涨停（sina hq.sinajs，分钟级实时）
+// - sector    板块涨跌幅 Top/Bottom（东方财富 datacenter）
+// - external  CNH / HSI / HSTECH / 510300 / 159915（sina + 腾讯，分钟级实时）
+// - futures   IF / IH / IC / IM 升贴水（sina，分钟级实时）
+// - lhb       龙虎榜（东方财富，T 日盘后 17:30+ 才有，盘中只能拿 T-1）
+// - margin    两融余额（东方财富 datacenter，T+1，盘后 18:00+ 才有 T 日数据）
+// - macro     启发式种子，不打远程
+//
+// 不在此处触发：news（LLM 分类，昂贵，走 cron）。
+//
+// 接受可选 query 参数 `lhbDate=YYYY-MM-DD` 覆盖龙虎榜目标日期，默认今天。
+app.post("/api/stock/signals/refresh", async (req, res) => {
+  const today = todayShanghai();
+  const lhbDate = (req.query.lhbDate as string | undefined) || today;
+  const result: {
+    quote?: Record<string, string | number | null>;
+    breadth?: unknown;
+    sector?: unknown;
+    external?: unknown;
+    futures?: unknown;
+    lhb?: unknown;
+    margin?: unknown;
+    macro?: number;
+  } = {};
+
+  // quote：先拉，asOfDate 才能跟上。复用 ingestToday：内部会计算 change/change_pct 与
+  // OHLCV 全字段一致地落库，避免重复维护 fetchDailyQuote → upsertQuote 这条路径。
+  try {
+    const rows = await ingestToday(undefined, today);
+    result.quote = Object.fromEntries(
+      rows.map((r) => [r.index_code, r.close_value ?? null])
+    );
+  } catch (e) {
+    logStage({
+      stage: "signals_refresh.quote_failed",
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+
+  // 并发拉其余 5 类，失败各自 swallow
+  const tasks: Array<Promise<void>> = [
+    (async () => {
+      try {
+        result.breadth = await ingestMarketBreadth(today);
+      } catch (e) {
+        logStage({
+          stage: "signals_refresh.breadth_failed",
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    })(),
+    (async () => {
+      try {
+        result.sector = await ingestSectorRotation(today);
+      } catch (e) {
+        logStage({
+          stage: "signals_refresh.sector_failed",
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    })(),
+    (async () => {
+      try {
+        result.external = await ingestExternalProxies(today);
+      } catch (e) {
+        logStage({
+          stage: "signals_refresh.external_failed",
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    })(),
+    (async () => {
+      try {
+        result.futures = await ingestFuturesBasis(today);
+      } catch (e) {
+        logStage({
+          stage: "signals_refresh.futures_failed",
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    })(),
+    (async () => {
+      try {
+        result.lhb = await ingestLhb(lhbDate);
+      } catch (e) {
+        logStage({
+          stage: "signals_refresh.lhb_failed",
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    })(),
+    (async () => {
+      try {
+        result.margin = await ingestLatestMargin();
+      } catch (e) {
+        logStage({
+          stage: "signals_refresh.margin_failed",
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    })(),
+  ];
+  await Promise.allSettled(tasks);
+
+  try {
+    ensureRecentMacroSeed(today);
+    result.macro = 1;
+  } catch {
+    result.macro = 0;
+  }
+  res.json({ ok: true, asOfDate: today, lhbDate, result });
+});
+
+app.post("/api/stock/reviews/refresh", (req, res) => {
+  const days = Number(req.body?.days ?? req.query?.days ?? 90);
+  try {
+    const result = reviewRecentPredictions(Number.isFinite(days) && days > 0 ? Math.min(365, days) : 90);
+    res.json({ ok: true, result });
+  } catch (e) {
+    logStage({
+      stage: "reviews_refresh.failed",
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    res.status(500).json({ error: "review refresh failed" });
   }
 });
 

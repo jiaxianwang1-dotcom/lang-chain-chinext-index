@@ -43,8 +43,11 @@
         <div class="pred-label" data-role="pred-label">AI 预测涨跌幅</div>
         <div class="pred-main">
           <span class="pred-pct" data-role="pred-pct">--</span>
+          <span class="pred-range" data-role="pred-range"></span>
+          <span class="pred-bucket" data-role="pred-bucket"></span>
           <span class="pred-conf" data-role="pred-conf"></span>
         </div>
+        <div class="pred-dims" data-role="pred-dims"></div>
         <div class="pred-rationale" data-role="pred-rationale"></div>
         <button class="pred-refresh" data-role="pred-refresh" type="button">重新预测</button>
       </div>
@@ -83,7 +86,10 @@
       status: card.querySelector('[data-role="status"]'),
       predLabel: card.querySelector('[data-role="pred-label"]'),
       predPct: card.querySelector('[data-role="pred-pct"]'),
+      predRange: card.querySelector('[data-role="pred-range"]'),
+      predBucket: card.querySelector('[data-role="pred-bucket"]'),
       predConf: card.querySelector('[data-role="pred-conf"]'),
+      predDims: card.querySelector('[data-role="pred-dims"]'),
       predRationale: card.querySelector('[data-role="pred-rationale"]'),
       predRefresh: card.querySelector('[data-role="pred-refresh"]'),
       chart: null,
@@ -237,6 +243,8 @@
     }
   }
 
+  const BUCKET_LABEL = { small: "小幅", medium: "中幅", large: "大幅" };
+
   async function loadCardPrediction(code, { force = false } = {}) {
     const c = cards.get(code);
     if (!c) return;
@@ -244,6 +252,9 @@
     const prevPctText = c.predPct.textContent;
     c.predPct.textContent = "预测中...";
     c.predPct.className = "pred-pct";
+    c.predRange.textContent = "";
+    c.predBucket.textContent = "";
+    c.predDims.textContent = "";
     try {
       const url = `/api/stock/predictions/card?indexCode=${encodeURIComponent(code)}${force ? "&force=1" : ""}`;
       const res = await fetch(url);
@@ -258,12 +269,40 @@
         pct == null || !Number.isFinite(pct) ? "" : pct >= 0 ? "up" : "down";
       c.predPct.className = "pred-pct " + klass;
       c.predPct.textContent = fmtPct(pct);
+
+      // 区间
+      const lo = p.predicted_change_pct_low;
+      const hi = p.predicted_change_pct_high;
+      if (lo != null && hi != null && Number.isFinite(lo) && Number.isFinite(hi)) {
+        c.predRange.textContent = `区间 ${fmtPct(lo)} ~ ${fmtPct(hi)}`;
+      } else {
+        c.predRange.textContent = "";
+      }
+
+      // 档位
+      const bucket = p.magnitude_bucket;
+      if (bucket && BUCKET_LABEL[bucket]) {
+        c.predBucket.textContent = BUCKET_LABEL[bucket];
+        c.predBucket.className = "pred-bucket bucket-" + bucket;
+      } else {
+        c.predBucket.textContent = "";
+        c.predBucket.className = "pred-bucket";
+      }
+
       const conf =
         p.confidence != null && Number.isFinite(p.confidence)
           ? `置信度 ${(p.confidence * 100).toFixed(0)}%`
           : "";
       const basedOn = p.based_on_date ? ` · 基于 ${p.based_on_date}` : "";
       c.predConf.textContent = conf + basedOn;
+
+      // 维度计数
+      const dims = p.dimensions_used;
+      if (dims != null && Number.isFinite(dims)) {
+        c.predDims.textContent = `多信号维度: ${dims}/10`;
+      } else {
+        c.predDims.textContent = "";
+      }
       c.predRationale.textContent = p.rationale || "";
 
       // 同步到表格预测列：如果目标日已经在窗口内则就地更新

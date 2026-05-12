@@ -122,6 +122,65 @@ describe("GET /api/stock/trading-day", () => {
   });
 });
 
+describe("GET /api/stock/signals", () => {
+  it("无数据时也返回 200 + 7 大类结构完整", async () => {
+    const res = await request(app).get("/api/stock/signals");
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty("asOfDate");
+    expect(res.body).toHaveProperty("macro");
+    expect(Array.isArray(res.body.macro)).toBe(true);
+    expect(res.body).toHaveProperty("external");
+    expect(res.body.external).toHaveProperty("latest");
+    expect(res.body.external).toHaveProperty("cnhRecent");
+    expect(Array.isArray(res.body.futures)).toBe(true);
+    expect(Array.isArray(res.body.margin)).toBe(true);
+    expect(Array.isArray(res.body.breadth)).toBe(true);
+    expect(Array.isArray(res.body.sector)).toBe(true);
+    expect(res.body.lhb).toHaveProperty("total_count");
+    expect(Array.isArray(res.body.news)).toBe(true);
+  });
+
+  it("macro 维度即使空库也会自动写入启发式种子", async () => {
+    const res = await request(app).get("/api/stock/signals");
+    expect(res.status).toBe(200);
+    // 启发式种子覆盖 CN CPI / PMI / LPR / US CPI / 非农
+    const names = (res.body.macro as Array<{ event_name: string }>).map((e) => e.event_name);
+    expect(names.length).toBeGreaterThan(0);
+    // 至少其中之一会出现
+    expect(
+      names.some((n) => /CPI|PMI|LPR|非农/.test(n))
+    ).toBe(true);
+  });
+});
+
+describe("GET /api/stock/macro", () => {
+  it("接受 start/end，返回种子事件", async () => {
+    const res = await request(app).get("/api/stock/macro?start=2026-05-01&end=2026-05-31");
+    expect(res.status).toBe(200);
+    expect(res.body.start).toBe("2026-05-01");
+    expect(res.body.end).toBe("2026-05-31");
+    expect(Array.isArray(res.body.rows)).toBe(true);
+    expect(res.body.rows.length).toBeGreaterThan(0);
+  });
+});
+
+describe("GET /api/stock/external", () => {
+  it("空表也返回 200，latest=[]", async () => {
+    const res = await request(app).get("/api/stock/external");
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.latest)).toBe(true);
+    expect(Array.isArray(res.body.cnhRecent)).toBe(true);
+  });
+});
+
+describe("GET /api/stock/futures", () => {
+  it("空表也返回 200，rows=[]", async () => {
+    const res = await request(app).get("/api/stock/futures");
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.rows)).toBe(true);
+  });
+});
+
 describe("POST /api/stock/chat", () => {
   it("空 message 返 400", async () => {
     const res = await request(app).post("/api/stock/chat").send({ message: "" });

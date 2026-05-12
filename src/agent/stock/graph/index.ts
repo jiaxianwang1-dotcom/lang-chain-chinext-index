@@ -18,6 +18,9 @@ import { ingestLatestMargin } from "../providers/margin.js";
 import { ingestMarketBreadth } from "../providers/breadth.js";
 import { ingestSectorRotation } from "../providers/sector.js";
 import { ingestLhb } from "../providers/lhb.js";
+import { ingestExternalProxies } from "../providers/external.js";
+import { ingestFuturesBasis } from "../providers/futures.js";
+import { ensureRecentMacroSeed } from "../providers/macro.js";
 import { classifyTodayNews } from "../news/index.js";
 import { analyzeChangeReason, backfillReasons } from "../analysis/index.js";
 import {
@@ -25,6 +28,7 @@ import {
   predictAllTargets,
   predictNextTradingDay,
 } from "../prediction/index.js";
+import { reviewRecentPredictions } from "../review/index.js";
 import { buildNotifier, type SmsNotifier } from "../notify/index.js";
 import { logStage, timed } from "../utils/log.js";
 
@@ -274,17 +278,28 @@ export async function runOnce(opts: RunOnceOptions = {}): Promise<void> {
     );
   }
 
-  // 3-7) 多维度数据采集，全部 fail-safe
+  // 3-10) 多维度数据采集，全部 fail-safe（任一失败仅记日志，不阻塞预测）
   await safeStep("ingest_margin", () => ingestLatestMargin());
   await safeStep("ingest_breadth", () => ingestMarketBreadth(tradeDate));
   await safeStep("ingest_sector", () => ingestSectorRotation(tradeDate));
   await safeStep("ingest_lhb", () => ingestLhb(tradeDate));
   await safeStep("classify_news", () => classifyTodayNews(tradeDate));
+  // P1：新维度
+  await safeStep("ingest_external", () => ingestExternalProxies(tradeDate));
+  await safeStep("ingest_futures", () => ingestFuturesBasis(tradeDate));
+  await safeStep("seed_macro", async () => {
+    ensureRecentMacroSeed(tradeDate);
+  });
 
-  // 8) 预测（自动多信号）
+  // P2：盘后回顾（先于本轮预测：用今日实际行情比对"上轮 / 上几轮"对今日的预测）
+  await safeStep("review_predictions", async () => {
+    reviewRecentPredictions(90);
+  });
+
+  // 11) 预测（自动多信号）
   const predictions = await timed("predict", undefined, () => predictAllTargets());
 
-  // 9) 短信通知
+  // 12) 短信通知
   const notifier = opts.notifier ?? buildNotifier({ dryRun: opts.dryRun });
   await timed("notify", undefined, () => notifier.sendPredictionSms(predictions));
 }

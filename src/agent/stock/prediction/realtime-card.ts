@@ -1,26 +1,25 @@
-import { z } from "zod";
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 
 import { findIndexMeta } from "../providers/index.js";
-import { fetchQuoteWindow, todayShanghai, type QuoteRow } from "../realtime/index.js";
+import { todayShanghai } from "../realtime/index.js";
 import {
   getPrediction,
   upsertPrediction,
+  getLatestQuote,
   type IndexPredictionRow,
 } from "../db/index.js";
 import { logStage } from "../utils/log.js";
+import {
+  gatherMultiSignalContext,
+  normalizeMultiSignalPrediction,
+  PREDICT_MULTI_SIGNAL_SYSTEM,
+  buildMultiSignalUserPrompt,
+  safeParseMultiSignal,
+  type MultiSignalPrediction,
+} from "./index.js";
 
-// ==================== 类型 & Schema ====================
-
-const PredictPctSchema = z.object({
-  direction: z.enum(["up", "down"]),
-  confidence: z.number().min(0).max(1),
-  predicted_change_pct: z.number().min(-20).max(20),
-  rationale: z.string().min(1),
-});
-
-type PredictPct = z.infer<typeof PredictPctSchema>;
+// ==================== 类型 ====================
 
 export type CardTargetReason = "today" | "next_trading_day";
 
@@ -64,9 +63,6 @@ function isWeekdayShanghai(now: Date = new Date()): boolean {
  * 决定卡片要展示哪一天的预测：
  * - 今日是周一~周五 且 上海时间 < 14:30 → 预测今日
  * - 否则 → 预测下一交易日
- *
- * 注意：法定节假日不在这里特殊处理；调用方（API 层）会用 `isTradingDayHeuristic`
- * 做更精细的判定，若节假日就会切换为下一交易日预测。
  */
 export function decideCardTarget(
   isTodayTradingDay: boolean,
@@ -105,72 +101,7 @@ async function defaultInvokeLlm(systemPrompt: string, userPrompt: string): Promi
   return typeof res.content === "string" ? res.content : JSON.stringify(res.content);
 }
 
-const PREDICT_PCT_SYSTEM = `你是 A 股大盘短线方向 + 涨跌幅判断助手。
-输入：某只指数最近若干个交易日的真实日线（OHLCV + 涨跌幅）。
-任务：基于这些数据，预测**目标交易日**该指数的"收盘相对前一交易日收盘"的涨跌幅（单位：%）。
-
-硬性纪律：
-- 你只能引用上面表格里**实际出现**的数字，禁止编造表格中没有的字段。
-- 必须给出方向（up=买涨 / down=买跌），不允许中立。
-- 涨跌幅是带符号的小数：例如 +1.50 表示预测上涨 1.5%，-0.80 表示预测下跌 0.8%。
-- 涨跌幅与方向必须一致：direction=up 时 predicted_change_pct > 0；direction=down 时 < 0。
-- A 股指数单日波动通常在 -5% ~ +5% 之间，超过 ±3% 的预测必须有非常明确的近端信号。
-
-输出严格 JSON：
-{"direction":"up","confidence":0.62,"predicted_change_pct":0.85,"rationale":"≤120 字中文，必须引用 1-2 个具体收盘点位或涨跌幅"}
-
-不要 Markdown，不要解释字段。`;
-
-function fmtNum(v: number | null | undefined, digits = 2): string {
-  if (v == null || !Number.isFinite(v)) return "-";
-  return v.toFixed(digits);
-}
-
-function fmtVolume(v: number | null | undefined): string {
-  if (v == null || !Number.isFinite(v)) return "-";
-  if (v >= 1e12) return (v / 1e12).toFixed(2) + "万亿手";
-  if (v >= 1e8) return (v / 1e8).toFixed(2) + "亿手";
-  if (v >= 1e4) return (v / 1e4).toFixed(2) + "万手";
-  return Math.round(v).toString() + "手";
-}
-
-function formatRowsAsTable(rows: QuoteRow[]): string {
-  const header = "date\topen\thigh\tlow\tclose\tchg%\tvolume";
-  const body = rows
-    .map((r) =>
-      [
-        r.trade_date,
-        fmtNum(r.open_value),
-        fmtNum(r.high_value),
-        fmtNum(r.low_value),
-        fmtNum(r.close_value),
-        r.change_pct == null ? "-" : (r.change_pct >= 0 ? "+" : "") + r.change_pct.toFixed(2) + "%",
-        fmtVolume(r.volume),
-      ].join("\t")
-    )
-    .join("\n");
-  return `${header}\n${body}`;
-}
-
-function safeParseJson<T>(raw: string, schema: z.ZodSchema<T>): T | null {
-  const trimmed = raw.trim();
-  const candidates = [
-    trimmed,
-    trimmed.replace(/^```json\s*/i, "").replace(/```$/, "").trim(),
-    (trimmed.match(/\{[\s\S]*\}/) ?? [""])[0],
-  ];
-  for (const c of candidates) {
-    if (!c) continue;
-    try {
-      return schema.parse(JSON.parse(c));
-    } catch {
-      // try next
-    }
-  }
-  return null;
-}
-
-// ==================== 主入口 ====================
+// ==================== 主入口（v2：多信号 10 维 + 区间）====================
 
 export interface PredictCardOptions {
   /** 强制重算（默认 false：若 DB 已有则直接返回缓存）。*/
@@ -184,11 +115,14 @@ export interface PredictCardOptions {
 }
 
 /**
- * 为 (indexCode, targetDate) 生成"涨跌幅"预测并落库。如果库中已存在记录且未指定
- * force=true，则直接返回缓存；否则调用 LLM 重新预测。
+ * 为 (indexCode, targetDate) 生成"方向 + 涨跌幅 + 区间"预测并落库。
  *
- * 数据来源：实时窗口数据（fetchQuoteWindow），不依赖 cron 入库。这与需求文档
- * docs/requirement/11.md 保持一致：智能体路径全部实时拉取。
+ * v2 改动（P0 修复）：
+ *   - 接入与短信路径相同的 `gatherMultiSignalContext`（10 维度），不再仅用 OHLCV
+ *   - 输出新增 predicted_change_pct_low / predicted_change_pct_high / magnitude_bucket
+ *   - 数据来源沿用 stock_agent.db（cron 14:00 + 后续 P1 数据维度入库的结果）
+ *
+ * 缓存：若库中已存在 (index_code, target_date) 且未指定 force=true，直接返回缓存。
  */
 export async function predictChangePctForTarget(
   indexCode: string,
@@ -200,33 +134,43 @@ export async function predictChangePctForTarget(
 
   if (!opts.force) {
     const cached = getPrediction(indexCode, targetDate);
-    if (cached) return cached;
+    if (cached) {
+      // 仅当缓存的 based_on_date 还是"最新已收盘交易日"时复用。
+      // 否则说明：上次预测后 quote 表又有新一日数据入库（典型场景：
+      // 当日上午 09:30 之前已生成了基于 T-1 的预测，下午 15:00 收盘后
+      // 新的当日 quote 入库；此时 target 不变但 based_on 已陈旧）。
+      const latestQuote = getLatestQuote(indexCode);
+      const latestDate = latestQuote?.trade_date ?? null;
+      if (!latestDate || (cached.based_on_date ?? "") >= latestDate) {
+        return cached;
+      }
+      logStage({
+        stage: "realtime_card.cache_stale",
+        indexCode,
+        target_date: targetDate,
+        cached_based_on: cached.based_on_date,
+        latest_quote_date: latestDate,
+      });
+      // fallthrough → 重算
+    }
   }
 
   const windowDays = opts.windowDays ?? 30;
-  // 用实时接口拉一段窗口（end 至今日；30 天预设涵盖 30 自然日，足够 LLM 看 ~20 个交易日）
-  const rows = await fetchQuoteWindow(indexCode, windowDays <= 30 ? "1m" : "2m", {
-    now: opts.now,
-  });
-  if (rows.length === 0) {
-    throw new Error(`${indexCode} 实时数据为空，无法预测`);
-  }
-  const basedOn = rows[rows.length - 1].trade_date;
-
+  // 用与短信路径完全一致的多信号上下文（DB-backed）
+  const ctx = gatherMultiSignalContext(indexCode, windowDays);
+  const userPromptBase = buildMultiSignalUserPrompt(ctx);
   const userPrompt = [
-    `指数: ${meta.index_name} (${meta.index_code})`,
-    `目标交易日: ${targetDate}`,
-    `历史窗口: ${rows[0].trade_date} ~ ${basedOn}, 共 ${rows.length} 个交易日`,
-    `近 ${rows.length} 日行情明细：`,
-    formatRowsAsTable(rows),
+    `### 卡片预测附加说明`,
+    `目标交易日: ${targetDate}（与上下文 asOfDate=${ctx.asOfDate} 可能不同；asOfDate 是"截至最新已收盘交易日"）。`,
+    `请基于截至 ${ctx.asOfDate} 的 10 维数据，预测 ${targetDate} 的方向 + 涨跌幅区间。`,
     ``,
-    `请基于上述真实日线，预测 ${targetDate} 该指数的涨跌幅（相对前一交易日收盘的百分比）。`,
+    userPromptBase,
   ].join("\n");
 
   const llmInvoke = opts.llmInvoke ?? defaultInvokeLlm;
   let raw = "";
   try {
-    raw = await llmInvoke(PREDICT_PCT_SYSTEM, userPrompt);
+    raw = await llmInvoke(PREDICT_MULTI_SIGNAL_SYSTEM, userPrompt);
   } catch (e) {
     logStage({
       stage: "predict_card.llm_failed",
@@ -236,43 +180,61 @@ export async function predictChangePctForTarget(
     });
   }
 
-  const parsed: PredictPct | null = raw ? safeParseJson(raw, PredictPctSchema) : null;
-
-  // 兜底：用最近一日方向给一个保守的小幅预测，避免界面长期 "--"
-  const last = rows[rows.length - 1];
-  const fallback: PredictPct = parsed ?? {
-    direction: last.change_pct != null && last.change_pct >= 0 ? "up" : "down",
+  // 兜底
+  const lastDay = ctx.recent30[ctx.recent30.length - 1];
+  const lastPct = lastDay.change_pct ?? 0;
+  const fallback: MultiSignalPrediction = {
+    direction: lastPct >= 0 ? "up" : "down",
     confidence: 0.5,
-    predicted_change_pct: last.change_pct != null && last.change_pct >= 0 ? 0.3 : -0.3,
+    predicted_change_pct: lastPct >= 0 ? 0.3 : -0.3,
+    predicted_change_pct_low: lastPct >= 0 ? -0.1 : -0.7,
+    predicted_change_pct_high: lastPct >= 0 ? 0.7 : 0.1,
+    magnitude_bucket: "small",
     rationale: "（兜底）LLM 不可用或解析失败，按最近一日方向给出弱信号。",
+    signals: {
+      trend: "missing",
+      volume: "missing",
+      fund_flow: "missing",
+      breadth: "missing",
+      sector: "missing",
+      lhb: "missing",
+      news: "missing",
+      macro: "missing",
+      external: "missing",
+      futures: "missing",
+    },
   };
-
-  // direction 与 sign 不一致时校正（防御）
-  if (fallback.direction === "up" && fallback.predicted_change_pct < 0) {
-    fallback.predicted_change_pct = Math.abs(fallback.predicted_change_pct);
-  } else if (fallback.direction === "down" && fallback.predicted_change_pct > 0) {
-    fallback.predicted_change_pct = -Math.abs(fallback.predicted_change_pct);
-  }
+  const parsed = raw ? safeParseMultiSignal(raw, fallback) : fallback;
+  const norm = normalizeMultiSignalPrediction(parsed);
 
   const saved = upsertPrediction({
     index_code: indexCode,
     target_date: targetDate,
-    predicted_change_pct: fallback.predicted_change_pct,
-    direction: fallback.direction,
-    confidence: fallback.confidence,
-    rationale: fallback.rationale,
-    model: MODEL_TAG,
-    based_on_date: basedOn,
+    predicted_change_pct: norm.predicted_change_pct ?? null,
+    direction: norm.direction,
+    confidence: norm.confidence,
+    rationale: norm.rationale,
+    model: MODEL_TAG + "+multi-signal-v2",
+    based_on_date: ctx.asOfDate,
     predicted_at: new Date().toISOString(),
+    predicted_change_pct_low: norm.predicted_change_pct_low ?? null,
+    predicted_change_pct_high: norm.predicted_change_pct_high ?? null,
+    magnitude_bucket: norm.magnitude_bucket ?? null,
+    dimensions_used: ctx.dimensionsAvailable,
+    signals_json: norm.signals ? JSON.stringify(norm.signals) : null,
   });
 
   logStage({
     stage: "predict_card.done",
     indexCode,
     target: targetDate,
-    based_on: basedOn,
+    based_on: ctx.asOfDate,
     direction: saved.direction,
     pct: saved.predicted_change_pct,
+    low: saved.predicted_change_pct_low,
+    high: saved.predicted_change_pct_high,
+    bucket: saved.magnitude_bucket,
+    dimensions_used: saved.dimensions_used,
     ok: true,
   });
 
