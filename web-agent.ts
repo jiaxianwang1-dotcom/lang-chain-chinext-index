@@ -60,7 +60,7 @@ import {
   reviewRecentPredictions,
 } from "./src/agent/stock/review/index.js";
 import { analyzeRecentPredictions } from "./src/agent/stock/review/analysis.js";
-import { getReviewsInRange, getAnalysesInRange } from "./src/agent/stock/db/index.js";
+import { getReviewsInRange, getAnalysesInRange, getLatestLhbDate } from "./src/agent/stock/db/index.js";
 import { listTargetIndexes, findIndexMeta } from "./src/agent/stock/providers/index.js";
 import { predictAllTargets, predictNextTradingDay } from "./src/agent/stock/prediction/index.js";
 import { classifyTodayNews } from "./src/agent/stock/news/index.js";
@@ -1342,10 +1342,16 @@ app.get("/api/stock/signals", (_req, res) => {
     // 板块（最近一日）
     const sector = getLatestSectorRotation();
 
-    // 龙虎榜（最近一日，按 |净额| 排序）
+    // 龙虎榜：先查 asOfDate，无数据则回退到数据库中最新有数据的交易日
     let lhb: ReturnType<typeof getLhbActivity> | null = null;
     try {
       lhb = getLhbActivity(asOfDate);
+      if (lhb.total_count === 0) {
+        const latestLhbDate = getLatestLhbDate();
+        if (latestLhbDate && latestLhbDate !== asOfDate) {
+          lhb = getLhbActivity(latestLhbDate);
+        }
+      }
     } catch {
       lhb = { trade_date: asOfDate, total_count: 0, net_buy_total: 0, net_sell_total: 0, top_3_by_net_amount: [] };
     }
@@ -1429,10 +1435,11 @@ app.get("/api/stock/futures", (_req, res) => {
 //
 // 不在此处触发：news（LLM 分类，昂贵，走 cron）。
 //
-// 接受可选 query 参数 `lhbDate=YYYY-MM-DD` 覆盖龙虎榜目标日期，默认今天。
+// 接受可选 query 参数 `lhbDate=YYYY-MM-DD` 覆盖龙虎榜目标日期。
+// 默认行为：取数据库中最新有龙虎榜数据的交易日（而非今天，避免周末/节假日空跑）。
 app.post("/api/stock/signals/refresh", async (req, res) => {
   const today = todayShanghai();
-  const lhbDate = (req.query.lhbDate as string | undefined) || today;
+  const lhbDate = (req.query.lhbDate as string | undefined) || getLatestLhbDate() || today;
   const result: {
     quote?: Record<string, string | number | null>;
     breadth?: unknown;
