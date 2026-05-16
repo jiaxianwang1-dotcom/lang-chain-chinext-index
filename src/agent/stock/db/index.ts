@@ -45,10 +45,14 @@ function applyMigrations(db: Database.Database): void {
   for (const [col, def] of PREDICTION_EXTRA_COLUMNS) {
     ensureColumn(db, "index_predictions", col, def);
   }
+  ensureColumn(db, "news_event", "impact_days", "INTEGER");
 }
 
 export function getDb(): Database.Database {
-  if (_db) return _db;
+  if (_db) {
+    applyMigrations(_db);
+    return _db;
+  }
   const db = new Database(STOCK_DB_PATH);
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
@@ -167,6 +171,7 @@ export function getDb(): Database.Database {
       sentiment       REAL,
       impact_indices  TEXT,
       rationale       TEXT,
+      impact_days     INTEGER,
       created_at      TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_news_event_date ON news_event(as_of_date DESC);
@@ -767,6 +772,7 @@ export interface NewsEventRow {
   sentiment: number | null;
   impact_indices: string | null; // JSON array as string OR 'broad'
   rationale: string | null;
+  impact_days?: number | null;
   created_at?: string;
 }
 
@@ -779,8 +785,8 @@ export function insertNewsEventIfAbsent(row: NewsEventRow): boolean {
   if (exists) return false;
   db.prepare(
     `INSERT INTO news_event
-     (as_of_date, source, url, title, summary, category, sentiment, impact_indices, rationale, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?)`
+     (as_of_date, source, url, title, summary, category, sentiment, impact_indices, rationale, impact_days, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.as_of_date,
     row.source,
@@ -791,6 +797,7 @@ export function insertNewsEventIfAbsent(row: NewsEventRow): boolean {
     row.sentiment,
     row.impact_indices,
     row.rationale,
+    row.impact_days ?? 1,
     now
   );
   return true;
@@ -816,6 +823,37 @@ export function getRecentNews(limit = 30): NewsEventRow[] {
        LIMIT ?`
     )
     .all(limit) as NewsEventRow[];
+}
+
+/** 查询 [start, end] 日期范围内的新闻（按 sentiment 强度排序）。 */
+export function getNewsInRange(start: string, end: string, limit = 20): NewsEventRow[] {
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT * FROM news_event
+       WHERE as_of_date >= ? AND as_of_date <= ?
+       ORDER BY ABS(COALESCE(sentiment, 0)) DESC, as_of_date DESC, id ASC
+       LIMIT ?`
+    )
+    .all(start, end, limit) as NewsEventRow[];
+}
+
+/**
+ * 查询在指定日期仍然"有效"的新闻。
+ * 有效性 = as_of_date + impact_days >= queryDate。
+ * 用于捕获跨天持续影响的大事件（如降准、重大政策）。
+ */
+export function getActiveNews(queryDate: string, limit = 20): NewsEventRow[] {
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT * FROM news_event
+       WHERE as_of_date <= ?
+         AND date(as_of_date, '+' || COALESCE(impact_days, 1) || ' days') >= ?
+       ORDER BY ABS(COALESCE(sentiment, 0)) DESC, as_of_date DESC, id ASC
+       LIMIT ?`
+    )
+    .all(queryDate, queryDate, limit) as NewsEventRow[];
 }
 
 // ==================== AI 涨跌幅预测 CRUD ====================

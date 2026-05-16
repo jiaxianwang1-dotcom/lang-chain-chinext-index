@@ -265,8 +265,12 @@ async function safeStep<T>(label: string, fn: () => Promise<T>): Promise<T | nul
 export async function runOnce(opts: RunOnceOptions = {}): Promise<void> {
   // 1) 主行情入库（必需，失败即跳过非交易日）
   const ingested = await timed("ingest_quote", undefined, () => ingestToday(defaultProvider));
+  const today = new Date().toISOString().slice(0, 10);
+
   if (ingested.length === 0) {
+    // 非交易日：行情没有更新，但新闻是实时的，不受交易日限制
     logStage({ stage: "runOnce.skip_non_trading", ok: true });
+    await safeStep("classify_news", () => classifyTodayNews(today));
     return;
   }
   const tradeDate = ingested[0].trade_date;
@@ -283,7 +287,8 @@ export async function runOnce(opts: RunOnceOptions = {}): Promise<void> {
   await safeStep("ingest_breadth", () => ingestMarketBreadth(tradeDate));
   await safeStep("ingest_sector", () => ingestSectorRotation(tradeDate));
   await safeStep("ingest_lhb", () => ingestLhb(tradeDate));
-  await safeStep("classify_news", () => classifyTodayNews(tradeDate));
+  // 新闻用 today：交易日 today===tradeDate，语义一致；非交易日上面已处理
+  await safeStep("classify_news", () => classifyTodayNews(today));
   // P1：新维度
   await safeStep("ingest_external", () => ingestExternalProxies(tradeDate));
   await safeStep("ingest_futures", () => ingestFuturesBasis(tradeDate));

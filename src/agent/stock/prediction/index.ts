@@ -12,6 +12,8 @@ import {
   getLatestExternalProxy,
   getExternalProxyInRange,
   getLatestFuturesBasis,
+  getNewsInRange,
+  getActiveNews,
   type AnalysisMemoryRow,
   type IndexQuoteRow,
   type MarginBalanceRow,
@@ -503,12 +505,34 @@ function formatLhbSummary(
 }
 
 function formatNewsToday(asOfDate: string): string {
-  const events = getTodayNewsEvents(asOfDate, 10);
-  if (events.length === 0) return "<当日无已分类新闻事件>";
+  const today = new Date().toISOString().slice(0, 10);
+
+  // 1. [lastTradingDate, today] 范围内的新事件（覆盖上一交易日收盘后到当前的所有新闻）
+  const rangeEvents = getNewsInRange(asOfDate, today, 20);
+
+  // 2. 仍在有效期内的历史大事件（impact_days > 1，跨天持续影响）
+  const activeEvents = getActiveNews(today, 20);
+
+  // 3. 合并去重：按 title，保留最新 as_of_date 的版本
+  const byTitle = new Map<string, ReturnType<typeof getTodayNewsEvents>[number]>();
+  for (const e of [...rangeEvents, ...activeEvents]) {
+    const existing = byTitle.get(e.title);
+    if (!existing || e.as_of_date > existing.as_of_date) {
+      byTitle.set(e.title, e);
+    }
+  }
+
+  // 4. 按 sentiment 绝对值降序，取前 15 条（避免 prompt 过长）
+  const events = Array.from(byTitle.values())
+    .sort((a, b) => Math.abs(b.sentiment ?? 0) - Math.abs(a.sentiment ?? 0))
+    .slice(0, 15);
+
+  if (events.length === 0) return "<无相关新闻事件>";
   const lines: string[] = [];
   for (const e of events) {
     const s = e.sentiment != null ? (e.sentiment >= 0 ? "+" : "") + e.sentiment.toFixed(2) : "0";
-    lines.push(`[${e.category} ${s} ${e.impact_indices ?? "-"}] ${e.title}`);
+    const dayTag = e.as_of_date === today ? "" : ` (${e.as_of_date})`;
+    lines.push(`[${e.category} ${s} ${e.impact_indices ?? "-"}]${dayTag} ${e.title}`);
     if (e.rationale) lines.push(`  ↳ ${e.rationale}`);
   }
   return lines.join("\n");
@@ -645,7 +669,12 @@ export function gatherMultiSignalContext(
   if (breadth30.length > 0) dims += 1;
   if (sector.length > 0) dims += 1;
   if (signals.lhb_active) dims += 1;
-  if (getTodayNewsEvents(latest.trade_date, 1).length > 0) dims += 1;
+  const today = new Date().toISOString().slice(0, 10);
+  // 新闻维度：覆盖 [lastTradingDate, today] 新事件 + 仍在有效期内的历史大事件
+  const rangeNews = getNewsInRange(latest.trade_date, today, 1);
+  const activeNews = getActiveNews(today, 1);
+  const hasNewsToday = rangeNews.length > 0 || activeNews.length > 0;
+  if (hasNewsToday) dims += 1;
   if (macroEvents.length > 0) dims += 1;
   if (externalProxy.length > 0) dims += 1;
   if (futuresBasis.length > 0) dims += 1;
@@ -865,14 +894,17 @@ export async function predictNextTradingDay(
   // 预测前若当日新闻为空，自动触发采集（非交易日/首次运行时常缺失）
   const latestQuote = getLatestQuote(indexCode);
   if (latestQuote) {
+    const today = new Date().toISOString().slice(0, 10);
     const tradeDate = latestQuote.trade_date;
-    const existingNews = getTodayNewsEvents(tradeDate, 1);
+    // 新闻是实时的，按自然日检查；非交易日时 today 可能晚于 tradeDate
+    const newsDate = today > tradeDate ? today : tradeDate;
+    const existingNews = getTodayNewsEvents(newsDate, 1);
     if (existingNews.length === 0) {
-      logStage({ stage: "predict.news_empty_auto_classify", ok: true, indexCode, tradeDate });
+      logStage({ stage: "predict.news_empty_auto_classify", ok: true, indexCode, newsDate });
       try {
-        await classifyTodayNews(tradeDate);
+        await classifyTodayNews(newsDate);
       } catch (e) {
-        logStage({ stage: "predict.news_auto_classify_failed", ok: false, indexCode, tradeDate, error: e instanceof Error ? e.message : String(e) });
+        logStage({ stage: "predict.news_auto_classify_failed", ok: false, indexCode, newsDate, error: e instanceof Error ? e.message : String(e) });
       }
     }
   }

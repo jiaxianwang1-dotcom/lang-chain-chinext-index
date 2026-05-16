@@ -44,6 +44,7 @@ const ClassifiedItemSchema = z.object({
   sentiment: z.number().min(-1).max(1),
   impact_indices: ImpactSchema,
   rationale: z.string().min(1),
+  impact_days: z.number().min(1).max(7).default(1),
 });
 
 const ClassificationOutputSchema = z.object({
@@ -203,7 +204,7 @@ async function defaultWebSearch(query: string): Promise<string> {
 
 const CLASSIFY_SYSTEM = `你是 A 股财经新闻分析助手。任务：对用户提供的近期财经新闻进行结构化分类。
 
-输出 JSON：{"events":[{title, summary, category, sentiment, impact_indices, rationale}, ...]}
+输出 JSON：{"events":[{title, summary, category, sentiment, impact_indices, rationale, impact_days}, ...]}
 
 字段约束：
 1) category 必须是以下 11 个之一：
@@ -219,6 +220,12 @@ const CLASSIFY_SYSTEM = `你是 A 股财经新闻分析助手。任务：对用�
 6) 与 A 股关系不大的纯本地八卦/娱乐/体育 → category=other，sentiment=0
 7) 所有字符串值内部 MUST NOT 包含未转义的英文双引号（\"）。如果原文有引号，请删除或替换为中文引号「」。
 8) 优先保留与 A 股直接相关的国内财经/政策/行业新闻，海外新闻如无直接影响可省略。
+9) impact_days ∈ [1,7]：事件对 A 股影响的持续自然天数
+   - 1：普通新闻、单日公告（默认）
+   - 3：行业政策、公司季度业绩
+   - 5：央行货币政策、重大监管变化
+   - 7：地缘政治升级、系统性风险事件
+   判断依据：事件的性质和重大程度，而非主观猜测市场会反应几天。
 
 只输出 JSON，不要 Markdown 代码块。`;
 
@@ -560,6 +567,7 @@ async function _classifyTodayNewsImpl(
       sentiment: ev.sentiment,
       impact_indices: impact_str,
       rationale: ev.rationale,
+      impact_days: ev.impact_days,
     });
     if (ok) result.inserted += 1;
     else result.skipped_dup += 1;
@@ -584,6 +592,7 @@ async function _classifyTodayNewsImpl(
       sentiment: 0,
       impact_indices: "broad",
       rationale: "LLM 未识别到强相关事件",
+      impact_days: 1,
     });
     if (ok) result.inserted += 1;
   }
