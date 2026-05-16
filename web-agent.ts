@@ -34,6 +34,7 @@ import {
   getLatestSectorRotation,
   getNewsByDate,
   getActiveNews,
+  getNewsInRange,
   getPredictionsInRange,
   getLatestExternalProxy,
   getExternalProxyInRange,
@@ -1359,6 +1360,15 @@ app.get("/api/stock/signals", (_req, res) => {
     // 当前有效的新闻事件（含跨天影响的大事件，前 30 条）
     const today = todayShanghai();
     let news = getActiveNews(today, 30);
+    logStage({ stage: "signals.news_active", ok: true, today, count: news.length });
+    // 兜底：如果 activeNews 为空，直接取最近 7 天的新闻
+    if (news.length === 0) {
+      const start = new Date(`${today}T00:00:00Z`);
+      start.setUTCDate(start.getUTCDate() - 7);
+      const startStr = start.toISOString().slice(0, 10);
+      news = getNewsInRange(startStr, today, 30);
+      logStage({ stage: "signals.news_fallback", ok: true, start: startStr, end: today, count: news.length });
+    }
 
     const payload: SignalsPayload = {
       asOfDate,
