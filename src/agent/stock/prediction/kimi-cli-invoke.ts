@@ -47,23 +47,48 @@ export function createKimiCliInvoke(opts: KimiCliInvokeOptions = {}) {
 
     const start = Date.now();
     let raw = "";
-    try {
-      raw = execSync(
-        `${cliPath} --quiet --prompt ${JSON.stringify(fullPrompt)}`,
-        {
+    const attempts = [
+      `${cliPath} --quiet --prompt ${JSON.stringify(fullPrompt)}`,
+      `${cliPath} --print --prompt ${JSON.stringify(fullPrompt)}`,
+      `${cliPath} --prompt ${JSON.stringify(fullPrompt)}`,
+    ];
+    let lastError: Error | undefined;
+    for (const cmd of attempts) {
+      try {
+        // 临时清空 KIMI_BASE_URL，防止项目 .env 覆盖 config.toml 中的 Coding API URL
+        const env = { ...process.env };
+        delete env.KIMI_BASE_URL;
+        raw = execSync(cmd, {
           encoding: "utf-8",
           timeout: timeoutMs,
           maxBuffer: 10 * 1024 * 1024, // 10MB
+          env,
+        });
+        lastError = undefined;
+        break;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (msg.includes("No such option")) {
+          lastError = e instanceof Error ? e : new Error(msg);
+          continue; // try next fallback
         }
-      );
-    } catch (e) {
+        logStage({
+          stage: "kimi_cli.invoke_failed",
+          ok: false,
+          error: msg,
+          elapsed_ms: Date.now() - start,
+        });
+        throw e;
+      }
+    }
+    if (lastError) {
       logStage({
         stage: "kimi_cli.invoke_failed",
         ok: false,
-        error: e instanceof Error ? e.message : String(e),
+        error: lastError.message,
         elapsed_ms: Date.now() - start,
       });
-      throw e;
+      throw lastError;
     }
 
     const elapsed = Date.now() - start;
