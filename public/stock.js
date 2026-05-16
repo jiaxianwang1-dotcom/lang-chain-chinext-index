@@ -49,6 +49,19 @@
         </div>
         <div class="pred-dims" data-role="pred-dims"></div>
         <div class="pred-rationale" data-role="pred-rationale"></div>
+        <div class="pred-prompt-toggle" data-role="pred-prompt-toggle" style="display:none;">
+          <button class="pred-prompt-btn" data-role="pred-prompt-btn" type="button">查看提示词</button>
+        </div>
+        <div class="pred-prompt-panel" data-role="pred-prompt-panel" style="display:none;">
+          <div class="pred-prompt-section">
+            <div class="pred-prompt-title">系统提示词 (System Prompt)</div>
+            <pre class="pred-prompt-content" data-role="pred-system-prompt"></pre>
+          </div>
+          <div class="pred-prompt-section">
+            <div class="pred-prompt-title">用户提示词 (User Prompt)</div>
+            <pre class="pred-prompt-content" data-role="pred-user-prompt"></pre>
+          </div>
+        </div>
         <button class="pred-refresh" data-role="pred-refresh" type="button">重新预测</button>
       </div>
       <div class="card-chart-wrap">
@@ -91,6 +104,11 @@
       predConf: card.querySelector('[data-role="pred-conf"]'),
       predDims: card.querySelector('[data-role="pred-dims"]'),
       predRationale: card.querySelector('[data-role="pred-rationale"]'),
+      predPromptToggle: card.querySelector('[data-role="pred-prompt-toggle"]'),
+      predPromptBtn: card.querySelector('[data-role="pred-prompt-btn"]'),
+      predPromptPanel: card.querySelector('[data-role="pred-prompt-panel"]'),
+      predSystemPrompt: card.querySelector('[data-role="pred-system-prompt"]'),
+      predUserPrompt: card.querySelector('[data-role="pred-user-prompt"]'),
       predRefresh: card.querySelector('[data-role="pred-refresh"]'),
       chart: null,
       rows: [],
@@ -304,6 +322,29 @@
         c.predDims.textContent = "";
       }
       c.predRationale.textContent = p.rationale || "";
+
+      // 提示词展示
+      const sysPrompt = payload.systemPrompt;
+      const userPrompt = payload.userPrompt;
+      if (sysPrompt || userPrompt) {
+        c.predPromptToggle.style.display = "";
+        c.predSystemPrompt.textContent = sysPrompt || "（无系统提示词）";
+        c.predUserPrompt.textContent = userPrompt || "（无用户提示词）";
+        // 绑定一次性点击事件（先移除旧的）
+        const btn = c.predPromptBtn;
+        const newBtn = btn.cloneNode(true);
+        btn.parentNode.replaceChild(newBtn, btn);
+        c.predPromptBtn = newBtn;
+        let expanded = false;
+        newBtn.addEventListener("click", () => {
+          expanded = !expanded;
+          c.predPromptPanel.style.display = expanded ? "" : "none";
+          newBtn.textContent = expanded ? "收起提示词" : "查看提示词";
+        });
+      } else {
+        c.predPromptToggle.style.display = "none";
+        c.predPromptPanel.style.display = "none";
+      }
 
       // 同步到表格预测列：如果目标日已经在窗口内则就地更新
       if (payload.target) {
