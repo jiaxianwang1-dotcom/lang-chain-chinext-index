@@ -747,17 +747,23 @@ const AgentState = Annotation.Root({
   }),
 });
 
+const _model = process.env.KIMI_MODEL ?? "kimi-k2.6";
+const _baseURL = process.env.KIMI_BASE_URL ?? "https://api.moonshot.cn/v1";
+const _temperature = _model.includes("k2.6") ? 1 : 0.7;
+
 const llm = new ChatOpenAI({
-  model: "moonshot-v1-32k",
+  model: _model,
   apiKey: process.env.KIMI_API_KEY,
-  configuration: { baseURL: "https://api.moonshot.cn/v1" },
+  configuration: { baseURL: _baseURL },
+  temperature: _temperature,
   streaming: true,
 });
 
 const summarizer = new ChatOpenAI({
-  model: "moonshot-v1-32k",
+  model: _model,
   apiKey: process.env.KIMI_API_KEY,
-  configuration: { baseURL: "https://api.moonshot.cn/v1" },
+  configuration: { baseURL: _baseURL },
+  temperature: _temperature,
 });
 
 const allTools = [

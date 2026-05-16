@@ -3,13 +3,14 @@ import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { insertNewsEventIfAbsent, getNewsByDate, type NewsEventRow } from "../db/index.js";
 import { logStage } from "../utils/log.js";
+import { createKimiCliInvoke } from "../prediction/kimi-cli-invoke.js";
 
 /**
  * 当日新闻事件采集 + LLM 分类。
  *
  * 原则：
  * - 不做常驻爬虫（财联社/东方财富 7x24 反爬严重）
- * - 预测前按需调用 webSearch 抓最近热点，传给 moonshot-v1-32k 做结构化分类
+ * - 预测前按需调用 webSearch 抓最近热点，传给 LLM 做结构化分类
  * - 失败时写空兜底，不阻塞预测主流程
  */
 
@@ -61,16 +62,30 @@ let _defaultLlm: ChatOpenAI | null = null;
 function getDefaultLlm(): ChatOpenAI {
   if (_defaultLlm) return _defaultLlm;
   _defaultLlm = new ChatOpenAI({
-    model: "moonshot-v1-32k",
+    model: process.env.KIMI_MODEL ?? "kimi-k2.6",
     apiKey: process.env.KIMI_API_KEY,
-    configuration: { baseURL: "https://api.moonshot.cn/v1" },
-    temperature: 0.1,
+    configuration: { baseURL: process.env.KIMI_BASE_URL ?? "https://api.moonshot.cn/v1" },
+    temperature: process.env.KIMI_MODEL?.includes("k2.6") ? 1 : 0.1,
     maxTokens: 4096,
   });
   return _defaultLlm;
 }
 
+let _kimiCliInvoke: ReturnType<typeof createKimiCliInvoke> | null = null;
+
 async function defaultInvokeLlm(system: string, user: string): Promise<string> {
+  if (process.env.USE_KIMI_CLI === "true") {
+    if (!_kimiCliInvoke) {
+      _kimiCliInvoke = createKimiCliInvoke({
+        cliPath: process.env.KIMI_CLI_PATH,
+        timeoutMs: process.env.KIMI_CLI_TIMEOUT_MS
+          ? parseInt(process.env.KIMI_CLI_TIMEOUT_MS, 10)
+          : 120_000,
+      });
+    }
+    return _kimiCliInvoke(system, user);
+  }
+
   const llm = getDefaultLlm();
   const res = await llm.invoke([new SystemMessage(system), new HumanMessage(user)]);
   return typeof res.content === "string" ? res.content : JSON.stringify(res.content);
@@ -88,6 +103,11 @@ async function kimiWebSearch(query: string): Promise<string> {
   const apiKey = process.env.KIMI_API_KEY;
   if (!apiKey) return "";
 
+  const baseUrl = process.env.KIMI_BASE_URL ?? "https://api.moonshot.cn/v1";
+  const searchModel = process.env.KIMI_SEARCH_MODEL ?? "moonshot-v1-8k";
+  const followUpModel = process.env.KIMI_SEARCH_FOLLOWUP_MODEL ?? process.env.KIMI_MODEL ?? "kimi-k2.6";
+  const temperature = followUpModel.includes("k2.6") ? 1 : 0.1;
+
   const systemContent =
     "你是一个搜索助手。请使用 web_search 工具搜索用户的问题，然后以纯文本列表形式返回搜索结果。每条结果一行，格式：标题 - 摘要（URL）。只输出结果列表，不要额外解释。";
   const tools = [{ type: "builtin_function", function: { name: "$web_search" } }];
@@ -100,20 +120,20 @@ async function kimiWebSearch(query: string): Promise<string> {
     }>;
   };
   try {
-    const res1 = await fetch("https://api.moonshot.cn/v1/chat/completions", {
+    const res1 = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "moonshot-v1-8k",
+        model: searchModel,
         messages: [
           { role: "system", content: systemContent },
           { role: "user", content: query },
         ],
         tools,
-        temperature: 0.1,
+        temperature,
       }),
       signal: AbortSignal.timeout(20000),
     });
@@ -137,17 +157,16 @@ async function kimiWebSearch(query: string): Promise<string> {
   }
 
   // ---- Round 2: 把 tool_calls 结果传回 ----
-  // 使用 32k 模型：Round 1 返回的 tool arguments 可能很长，加上 system/user 后容易超过 8k 限制
   const toolCall = toolCalls[0];
   try {
-    const res2 = await fetch("https://api.moonshot.cn/v1/chat/completions", {
+    const res2 = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "moonshot-v1-32k",
+        model: followUpModel,
         messages: [
           { role: "system", content: systemContent },
           { role: "user", content: query },
@@ -165,7 +184,7 @@ async function kimiWebSearch(query: string): Promise<string> {
           { role: "tool", tool_call_id: toolCall.id, content: toolCall.function.arguments },
         ],
         tools,
-        temperature: 0.1,
+        temperature,
       }),
       signal: AbortSignal.timeout(20000),
     });

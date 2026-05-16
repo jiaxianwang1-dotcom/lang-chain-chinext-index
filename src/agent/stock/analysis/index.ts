@@ -9,6 +9,7 @@ import {
 } from "../db/index.js";
 import { findIndexMeta, listTargetIndexes } from "../providers/index.js";
 import { logStage, sleep } from "../utils/log.js";
+import { createKimiCliInvoke } from "../prediction/kimi-cli-invoke.js";
 
 // ==================== 可注入的依赖 ====================
 
@@ -29,15 +30,29 @@ let _defaultLlm: ChatOpenAI | null = null;
 function getDefaultLlm(): ChatOpenAI {
   if (_defaultLlm) return _defaultLlm;
   _defaultLlm = new ChatOpenAI({
-    model: "moonshot-v1-32k",
+    model: process.env.KIMI_MODEL ?? "kimi-k2.6",
     apiKey: process.env.KIMI_API_KEY,
-    configuration: { baseURL: "https://api.moonshot.cn/v1" },
-    temperature: 0.2,
+    configuration: { baseURL: process.env.KIMI_BASE_URL ?? "https://api.moonshot.cn/v1" },
+    temperature: process.env.KIMI_MODEL?.includes("k2.6") ? 1 : 0.2,
   });
   return _defaultLlm;
 }
 
+let _kimiCliInvoke: ReturnType<typeof createKimiCliInvoke> | null = null;
+
 async function defaultInvokeLlm(systemPrompt: string, userPrompt: string): Promise<string> {
+  if (process.env.USE_KIMI_CLI === "true") {
+    if (!_kimiCliInvoke) {
+      _kimiCliInvoke = createKimiCliInvoke({
+        cliPath: process.env.KIMI_CLI_PATH,
+        timeoutMs: process.env.KIMI_CLI_TIMEOUT_MS
+          ? parseInt(process.env.KIMI_CLI_TIMEOUT_MS, 10)
+          : 120_000,
+      });
+    }
+    return _kimiCliInvoke(systemPrompt, userPrompt);
+  }
+
   const llm = getDefaultLlm();
   const res = await llm.invoke([new SystemMessage(systemPrompt), new HumanMessage(userPrompt)]);
   return typeof res.content === "string" ? res.content : JSON.stringify(res.content);

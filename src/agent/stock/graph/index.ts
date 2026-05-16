@@ -159,10 +159,10 @@ let _llm: ChatOpenAI | null = null;
 function getLlm(): ChatOpenAI {
   if (_llm) return _llm;
   _llm = new ChatOpenAI({
-    model: "moonshot-v1-32k",
+    model: process.env.KIMI_MODEL ?? "kimi-k2.6",
     apiKey: process.env.KIMI_API_KEY,
-    configuration: { baseURL: "https://api.moonshot.cn/v1" },
-    temperature: 0.2,
+    configuration: { baseURL: process.env.KIMI_BASE_URL ?? "https://api.moonshot.cn/v1" },
+    temperature: 1,
   });
   return _llm;
 }

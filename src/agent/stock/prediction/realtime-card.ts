@@ -18,6 +18,7 @@ import {
   safeParseMultiSignal,
   type MultiSignalPrediction,
 } from "./index.js";
+import { createKimiCliInvoke } from "./kimi-cli-invoke.js";
 
 // ==================== 类型 ====================
 
@@ -32,7 +33,7 @@ export interface CardTargetInfo {
   label: string;
 }
 
-const MODEL_TAG = "moonshot-v1-32k";
+const MODEL_TAG = process.env.KIMI_MODEL ?? "kimi-k2.6";
 
 // ==================== 时间 / 交易日工具 ====================
 
@@ -89,13 +90,27 @@ function getDefaultLlm(): ChatOpenAI {
   _defaultLlm = new ChatOpenAI({
     model: MODEL_TAG,
     apiKey: process.env.KIMI_API_KEY,
-    configuration: { baseURL: "https://api.moonshot.cn/v1" },
-    temperature: 0.2,
+    configuration: { baseURL: process.env.KIMI_BASE_URL ?? "https://api.moonshot.cn/v1" },
+    temperature: MODEL_TAG.includes("k2.6") ? 1 : 0.2,
   });
   return _defaultLlm;
 }
 
+let _kimiCliInvoke: ReturnType<typeof createKimiCliInvoke> | null = null;
+
 async function defaultInvokeLlm(systemPrompt: string, userPrompt: string): Promise<string> {
+  if (process.env.USE_KIMI_CLI === "true") {
+    if (!_kimiCliInvoke) {
+      _kimiCliInvoke = createKimiCliInvoke({
+        cliPath: process.env.KIMI_CLI_PATH,
+        timeoutMs: process.env.KIMI_CLI_TIMEOUT_MS
+          ? parseInt(process.env.KIMI_CLI_TIMEOUT_MS, 10)
+          : 120_000,
+      });
+    }
+    return _kimiCliInvoke(systemPrompt, userPrompt);
+  }
+
   const llm = getDefaultLlm();
   const res = await llm.invoke([new SystemMessage(systemPrompt), new HumanMessage(userPrompt)]);
   return typeof res.content === "string" ? res.content : JSON.stringify(res.content);
