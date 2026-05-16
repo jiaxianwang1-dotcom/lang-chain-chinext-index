@@ -1309,7 +1309,7 @@ interface SignalsPayload {
 app.get("/api/stock/signals", (_req, res) => {
   try {
     const sse = getLatestQuote("000001.SH");
-    const asOfDate = sse?.trade_date ?? new Date().toISOString().slice(0, 10);
+    const asOfDate = sse?.trade_date ?? todayShanghai();
 
     // 宏观：近 7 天 / 后 5 天
     try {
@@ -1357,7 +1357,7 @@ app.get("/api/stock/signals", (_req, res) => {
     }
 
     // 当前有效的新闻事件（含跨天影响的大事件，前 30 条）
-    const today = new Date().toISOString().slice(0, 10);
+    const today = todayShanghai();
     let news = getActiveNews(today, 30);
 
     const payload: SignalsPayload = {
