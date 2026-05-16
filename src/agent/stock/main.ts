@@ -10,6 +10,7 @@ import { predictAllTargets } from "./prediction/index.js";
 import { buildNotifier } from "./notify/index.js";
 import { reviewRecentPredictions } from "./review/index.js";
 import { logStage, timed } from "./utils/log.js";
+import { todayShanghai } from "./realtime/range.js";
 
 // LangSmith：默认覆盖为本智能体专属项目
 if (process.env.LANGCHAIN_TRACING_V2 === "true" && !process.env.LANGCHAIN_PROJECT_OVERRIDE) {
@@ -142,7 +143,7 @@ async function main(): Promise<void> {
     "0 9,18 * * *",
     async () => {
       try {
-        const today = new Date().toISOString().slice(0, 10);
+        const today = todayShanghai();
         logStage({ stage: "cron.news_start", ok: true, today });
         await classifyTodayNews(today);
         logStage({ stage: "cron.news_done", ok: true, today });

@@ -14,6 +14,7 @@ import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { defaultProvider } from "../providers/index.js";
 import { backfillOneYear, ingestToday } from "../providers/ingestion.js";
 import type { QuoteRow } from "../realtime/index.js";
+import { todayShanghai } from "../realtime/range.js";
 import { ingestLatestMargin } from "../providers/margin.js";
 import { ingestMarketBreadth } from "../providers/breadth.js";
 import { ingestSectorRotation } from "../providers/sector.js";
@@ -265,7 +266,7 @@ async function safeStep<T>(label: string, fn: () => Promise<T>): Promise<T | nul
 export async function runOnce(opts: RunOnceOptions = {}): Promise<void> {
   // 1) 主行情入库（必需，失败即跳过非交易日）
   const ingested = await timed("ingest_quote", undefined, () => ingestToday(defaultProvider));
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayShanghai();
 
   if (ingested.length === 0) {
     // 非交易日：行情没有更新，但新闻是实时的，不受交易日限制

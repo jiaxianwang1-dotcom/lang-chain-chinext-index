@@ -29,6 +29,7 @@ import { computeAnomalySignals, type AnomalySignals } from "../signals/index.js"
 import { getTodayNewsEvents, classifyTodayNews } from "../news/index.js";
 import { getMacroEventsAround, ensureRecentMacroSeed } from "../providers/macro.js";
 import { logStage } from "../utils/log.js";
+import { todayShanghai } from "../realtime/range.js";
 
 // ==================== Schemas ====================
 
@@ -505,7 +506,7 @@ function formatLhbSummary(
 }
 
 function formatNewsToday(asOfDate: string): string {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayShanghai();
 
   // 1. [lastTradingDate, today] 范围内的新事件（覆盖上一交易日收盘后到当前的所有新闻）
   const rangeEvents = getNewsInRange(asOfDate, today, 20);
@@ -669,7 +670,7 @@ export function gatherMultiSignalContext(
   if (breadth30.length > 0) dims += 1;
   if (sector.length > 0) dims += 1;
   if (signals.lhb_active) dims += 1;
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayShanghai();
   // 新闻维度：覆盖 [lastTradingDate, today] 新事件 + 仍在有效期内的历史大事件
   const rangeNews = getNewsInRange(latest.trade_date, today, 1);
   const activeNews = getActiveNews(today, 1);
@@ -894,7 +895,7 @@ export async function predictNextTradingDay(
   // 预测前若当日新闻为空，自动触发采集（非交易日/首次运行时常缺失）
   const latestQuote = getLatestQuote(indexCode);
   if (latestQuote) {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = todayShanghai();
     const tradeDate = latestQuote.trade_date;
     // 新闻是实时的，按自然日检查；非交易日时 today 可能晚于 tradeDate
     const newsDate = today > tradeDate ? today : tradeDate;

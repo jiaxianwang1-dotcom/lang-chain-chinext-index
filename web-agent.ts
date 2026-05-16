@@ -1549,11 +1549,10 @@ app.post("/api/stock/signals/refresh", async (req, res) => {
   }
 
   // 新闻：用户主动刷新时应触发采集（LLM 分类，可能较慢，不阻塞响应）
-  // 新闻日期必须与行情日期对齐，避免行情未入库时新闻按今天分类导致面板查不到
+  // 新闻是实时发生的，不受交易日限制，必须用自然日 today 而非行情日期
   (async () => {
     try {
-      const quoteDate = getLatestQuote("000001.SH")?.trade_date ?? today;
-      await classifyTodayNews(quoteDate, { force: true });
+      await classifyTodayNews(today, { force: true });
     } catch (e) {
       logStage({
         stage: "signals_refresh.news_failed",
