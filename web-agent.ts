@@ -1439,7 +1439,10 @@ app.get("/api/stock/futures", (_req, res) => {
 // 默认行为：取数据库中最新有龙虎榜数据的交易日（而非今天，避免周末/节假日空跑）。
 app.post("/api/stock/signals/refresh", async (req, res) => {
   const today = todayShanghai();
-  const lhbDate = (req.query.lhbDate as string | undefined) || getLatestLhbDate() || today;
+  // LHB 默认日期：优先数据库最新日期；数据库为空时取最近交易日（避免周末/节假日空跑）
+  const latestQuote = getLatestQuote("000001.SH");
+  const nearestTradingDay = latestQuote?.trade_date ?? today;
+  const lhbDate = (req.query.lhbDate as string | undefined) || getLatestLhbDate() || nearestTradingDay;
   const result: {
     quote?: Record<string, string | number | null>;
     breadth?: unknown;

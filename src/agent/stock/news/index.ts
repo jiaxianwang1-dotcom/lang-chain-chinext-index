@@ -77,11 +77,29 @@ async function defaultInvokeLlm(system: string, user: string): Promise<string> {
 
 export type WebSearchFn = (query: string) => Promise<string>;
 
+interface KimiToolCall {
+  id: string;
+  type: string;
+  function: { name: string; arguments: string };
+}
+
 async function kimiWebSearch(query: string): Promise<string> {
   const apiKey = process.env.KIMI_API_KEY;
   if (!apiKey) return "";
+
+  const systemContent =
+    "你是一个搜索助手。请使用 web_search 工具搜索用户的问题，然后以纯文本列表形式返回搜索结果。每条结果一行，格式：标题 - 摘要（URL）。只输出结果列表，不要额外解释。";
+  const tools = [{ type: "builtin_function", function: { name: "$web_search" } }];
+
+  // ---- Round 1: 请求 tool_calls ----
+  let round1: {
+    choices?: Array<{
+      message?: { content?: string; tool_calls?: KimiToolCall[] };
+      finish_reason?: string;
+    }>;
+  };
   try {
-    const res = await fetch("https://api.moonshot.cn/v1/chat/completions", {
+    const res1 = await fetch("https://api.moonshot.cn/v1/chat/completions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -90,27 +108,74 @@ async function kimiWebSearch(query: string): Promise<string> {
       body: JSON.stringify({
         model: "moonshot-v1-8k",
         messages: [
-          {
-            role: "system",
-            content:
-              "你是一个搜索助手。请使用 web_search 工具搜索用户的问题，然后以纯文本列表形式返回搜索结果。每条结果一行，格式：标题 - 摘要（URL）。只输出结果列表，不要额外解释。",
-          },
+          { role: "system", content: systemContent },
           { role: "user", content: query },
         ],
-        tools: [{ type: "builtin_function", builtin_function: { name: "$web_search" } }],
+        tools,
         temperature: 0.1,
       }),
       signal: AbortSignal.timeout(20000),
     });
-    if (!res.ok) {
-      const body = await res.text().catch(() => "<failed to read body>");
-      logStage({ stage: "news.kimi_http_failed", ok: false, query, status: res.status, body_preview: body.slice(0, 300) });
+    if (!res1.ok) {
+      const body = await res1.text().catch(() => "<failed to read body>");
+      logStage({ stage: "news.kimi_http_failed", ok: false, query, status: res1.status, body_preview: body.slice(0, 300) });
       return "";
     }
-    const data = (await res.json()) as {
+    round1 = (await res1.json()) as typeof round1;
+  } catch (e) {
+    logStage({ stage: "news.kimi_search_failed", ok: false, query, error: e instanceof Error ? e.message : String(e) });
+    return "";
+  }
+
+  const toolCalls = round1.choices?.[0]?.message?.tool_calls;
+  if (!toolCalls || toolCalls.length === 0) {
+    // 没有触发 tool_calls，直接返回 content（可能模型直接回答了）
+    const direct = round1.choices?.[0]?.message?.content ?? "";
+    logStage({ stage: "news.kimi_no_tool_calls", ok: true, query, content_length: direct.length });
+    return direct;
+  }
+
+  // ---- Round 2: 把 tool_calls 结果传回 ----
+  const toolCall = toolCalls[0];
+  try {
+    const res2 = await fetch("https://api.moonshot.cn/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "moonshot-v1-8k",
+        messages: [
+          { role: "system", content: systemContent },
+          { role: "user", content: query },
+          {
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              {
+                id: toolCall.id,
+                type: toolCall.type,
+                function: { name: toolCall.function.name, arguments: toolCall.function.arguments },
+              },
+            ],
+          },
+          { role: "tool", tool_call_id: toolCall.id, content: toolCall.function.arguments },
+        ],
+        tools,
+        temperature: 0.1,
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res2.ok) {
+      const body = await res2.text().catch(() => "<failed to read body>");
+      logStage({ stage: "news.kimi_round2_http_failed", ok: false, query, status: res2.status, body_preview: body.slice(0, 300) });
+      return "";
+    }
+    const round2 = (await res2.json()) as {
       choices?: Array<{ message?: { content?: string } }>;
     };
-    const content = data.choices?.[0]?.message?.content ?? "";
+    const content = round2.choices?.[0]?.message?.content ?? "";
     logStage({ stage: "news.kimi_raw", ok: true, query, raw_length: content.length, raw_preview: content.slice(0, 300) });
     // 尽量适配 extractHeadlines 的解析逻辑：把行包装成 【摘要】xxx 格式
     const lines = content
