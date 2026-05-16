@@ -136,6 +136,7 @@ async function kimiWebSearch(query: string): Promise<string> {
   }
 
   // ---- Round 2: 把 tool_calls 结果传回 ----
+  // 使用 32k 模型：Round 1 返回的 tool arguments 可能很长，加上 system/user 后容易超过 8k 限制
   const toolCall = toolCalls[0];
   try {
     const res2 = await fetch("https://api.moonshot.cn/v1/chat/completions", {
@@ -145,7 +146,7 @@ async function kimiWebSearch(query: string): Promise<string> {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "moonshot-v1-8k",
+        model: "moonshot-v1-32k",
         messages: [
           { role: "system", content: systemContent },
           { role: "user", content: query },
@@ -320,6 +321,9 @@ async function fetchSinaNews(limit = 15): Promise<RawHeadline[]> {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         Referer: "https://finance.sina.com.cn/",
         Accept: "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        Connection: "keep-alive",
       },
     });
     if (!res.ok) {
