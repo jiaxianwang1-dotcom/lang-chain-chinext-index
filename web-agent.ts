@@ -33,7 +33,7 @@ import {
   getLatestBreadth,
   getLatestSectorRotation,
   getNewsByDate,
-  getRecentNews,
+  getActiveNews,
   getPredictionsInRange,
   getLatestExternalProxy,
   getExternalProxyInRange,
@@ -627,7 +627,7 @@ const queryLhbToday = tool(
 
 const queryTodayEvents = tool(
   ({ as_of_date }: { as_of_date?: string }) => {
-    const date = as_of_date ?? getLatestQuote("000001.SH")?.trade_date ?? new Date().toISOString().slice(0, 10);
+    const date = as_of_date ?? new Date().toISOString().slice(0, 10);
     const events = getNewsByDate(date, 30);
     if (events.length === 0) return `[${date}] 当日无已分类新闻事件。可调用 web_search 临时搜索。`;
     const grouped = new Map<string, typeof events>();
@@ -1356,8 +1356,9 @@ app.get("/api/stock/signals", (_req, res) => {
       lhb = { trade_date: asOfDate, total_count: 0, net_buy_total: 0, net_sell_total: 0, top_3_by_net_amount: [] };
     }
 
-    // 最近已分类新闻事件（不限日期，前 30 条）
-    let news = getRecentNews(30);
+    // 当前有效的新闻事件（含跨天影响的大事件，前 30 条）
+    const today = new Date().toISOString().slice(0, 10);
+    let news = getActiveNews(today, 30);
 
     const payload: SignalsPayload = {
       asOfDate,

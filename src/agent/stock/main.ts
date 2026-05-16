@@ -5,6 +5,7 @@ import { backfillOneYear, refreshOhlcvForExistingQuotes } from "./providers/inge
 import { backfillMarginHistory } from "./providers/margin.js";
 import { backfillReasons } from "./analysis/index.js";
 import { runOnce } from "./graph/index.js";
+import { classifyTodayNews } from "./news/index.js";
 import { predictAllTargets } from "./prediction/index.js";
 import { buildNotifier } from "./notify/index.js";
 import { reviewRecentPredictions } from "./review/index.js";
@@ -136,11 +137,34 @@ async function main(): Promise<void> {
   reviewTask.start();
   logStage({ stage: "cron.review_registered", ok: true, expr: "0 16 * * 1-5", tz: "Asia/Shanghai" });
 
+  // 每天 9:00 / 18:00 采集新闻（新闻不受交易日限制，周末/节假日也可能有政策）
+  const newsTask = cron.schedule(
+    "0 9,18 * * *",
+    async () => {
+      try {
+        const today = new Date().toISOString().slice(0, 10);
+        logStage({ stage: "cron.news_start", ok: true, today });
+        await classifyTodayNews(today);
+        logStage({ stage: "cron.news_done", ok: true, today });
+      } catch (e) {
+        logStage({
+          stage: "cron.news_failed",
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    },
+    { timezone: "Asia/Shanghai" }
+  );
+  newsTask.start();
+  logStage({ stage: "cron.news_registered", ok: true, expr: "0 9,18 * * *", tz: "Asia/Shanghai" });
+
   // 防止进程退出
   process.on("SIGINT", () => {
     logStage({ stage: "shutdown", ok: true, signal: "SIGINT" });
     task.stop();
     reviewTask.stop();
+    newsTask.stop();
     process.exit(0);
   });
 }
