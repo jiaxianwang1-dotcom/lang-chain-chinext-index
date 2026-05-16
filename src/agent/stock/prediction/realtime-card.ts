@@ -241,6 +241,7 @@ export async function predictChangePctForTarget(
     magnitude_bucket: norm.magnitude_bucket ?? null,
     dimensions_used: ctx.dimensionsAvailable,
     signals_json: norm.signals ? JSON.stringify(norm.signals) : null,
+    prompt_text: userPrompt,
   });
 
   logStage({

@@ -50,6 +50,7 @@
             <th>区间命中</th>
             <th>幅度误差</th>
             <th>置信度</th>
+            <th>AI预测准确率分析</th>
           </tr>
         </thead>
         <tbody data-role="tbody"></tbody>
@@ -101,9 +102,9 @@
       .join("");
   }
 
-  function renderReviews(rows) {
+  function renderReviews(rows, analysisMap) {
     if (rows.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:#888;padding:20px;">暂无回顾数据。请先让系统采集预测，并在收盘后点击"重新比对"。</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="11" style="text-align:center;color:#888;padding:20px;">暂无回顾数据。请先让系统采集预测，并在收盘后点击"重新比对"。</td></tr>`;
       return;
     }
     const indexName = (code) => {
@@ -120,6 +121,11 @@
           r.predicted_low == null || r.predicted_high == null
             ? "-"
             : `${fmtPct(r.predicted_low)} ~ ${fmtPct(r.predicted_high)}`;
+        const key = `${r.index_code}:${r.target_date}`;
+        const ana = analysisMap?.get(key);
+        const anaHtml = ana
+          ? `<div class="acc-analysis" title="${escapeHtml(ana.analysis_summary)}">${escapeHtml(ana.analysis_summary)}</div>`
+          : `<span style="color:#999;font-size:11px;">-</span>`;
         return `
           <tr>
             <td>${escapeHtml(indexName(r.index_code))}</td>
@@ -132,6 +138,7 @@
             <td class="${rangeHitClass}">${r.range_hit == null ? "-" : r.range_hit === 1 ? "✓" : "✗"}</td>
             <td>${r.pct_abs_error == null ? "-" : r.pct_abs_error.toFixed(2)}</td>
             <td>${r.confidence == null ? "-" : (r.confidence * 100).toFixed(0) + "%"}</td>
+            <td>${anaHtml}</td>
           </tr>
         `;
       })
@@ -159,17 +166,28 @@
     try {
       const codes = idx ? [idx] : TARGETS.map((t) => t.code);
       const all = [];
+      const analysisMap = new Map();
       for (const code of codes) {
-        const res = await fetch(`/api/stock/reviews?indexCode=${encodeURIComponent(code)}&days=${days}`);
-        if (!res.ok) continue;
-        const data = await res.json();
-        for (const row of data.rows || []) all.push(row);
+        const [res, anaRes] = await Promise.all([
+          fetch(`/api/stock/reviews?indexCode=${encodeURIComponent(code)}&days=${days}`),
+          fetch(`/api/stock/analysis?indexCode=${encodeURIComponent(code)}&days=${days}`),
+        ]);
+        if (res.ok) {
+          const data = await res.json();
+          for (const row of data.rows || []) all.push(row);
+        }
+        if (anaRes.ok) {
+          const anaData = await anaRes.json();
+          for (const a of anaData.rows || []) {
+            analysisMap.set(`${a.index_code}:${a.target_date}`, a);
+          }
+        }
       }
       // 按 target_date 倒序
       all.sort((a, b) => (a.target_date < b.target_date ? 1 : a.target_date > b.target_date ? -1 : 0));
-      renderReviews(all);
+      renderReviews(all, analysisMap);
     } catch (e) {
-      tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:#c0392b;padding:20px;">加载明细失败</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="11" style="text-align:center;color:#c0392b;padding:20px;">加载明细失败</td></tr>`;
     }
   }
 

@@ -231,6 +231,19 @@
     .acc-reviews-table td.miss { color: #c0392b; }
     .acc-reviews-table td.up { color: #c0392b; }
     .acc-reviews-table td.down { color: #27ae60; }
+    .acc-reviews-table td .acc-analysis {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 11px;
+      color: #444;
+      line-height: 1.4;
+      text-align: left;
+      max-width: 320px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: -webkit-box;
+      -webkit-line-clamp: 3;
+      -webkit-box-orient: vertical;
+    }
 
     /* ========== 多信号面板 Tab 样式 ========== */
     .sig-wrap { padding: 16px; flex: 1; overflow-y: auto; }
@@ -259,6 +272,7 @@
       box-shadow: 0 1px 4px rgba(0,0,0,0.06);
       padding: 14px 16px; display: flex; flex-direction: column; gap: 10px;
       min-width: 0;
+      height: 320px;
     }
     .sig-card-title {
       font-size: 14px; font-weight: 600; color: #333;
@@ -268,7 +282,9 @@
     .sig-card-title .sig-card-hint {
       font-size: 11px; color: #888; font-weight: 400;
     }
-    .sig-card-body { font-size: 12px; color: #555; line-height: 1.6; }
+    .sig-card-body { font-size: 12px; color: #555; line-height: 1.6; flex: 1; overflow-y: auto; }
+    .sig-card-body::-webkit-scrollbar { width: 4px; }
+    .sig-card-body::-webkit-scrollbar-thumb { background: #ddd; border-radius: 2px; }
     .sig-card-body .sig-empty { color: #aaa; padding: 12px; text-align: center; }
     .sig-row { display: flex; justify-content: space-between; padding: 2px 0; }
     .sig-row b {
@@ -321,6 +337,12 @@
     }
     .sig-news-item .sig-news-title { font-size: 12px; color: #333; }
     .sig-news-item .sig-news-rationale { font-size: 11px; color: #888; }
+    .sig-news-item.chi-next {
+      border-left: 3px solid #9b59b6;
+      padding-left: 8px;
+      background: #faf5ff;
+      border-radius: 0 4px 4px 0;
+    }
   </style>
 </head>
 <body>

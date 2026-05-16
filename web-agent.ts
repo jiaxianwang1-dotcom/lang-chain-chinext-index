@@ -33,6 +33,7 @@ import {
   getLatestBreadth,
   getLatestSectorRotation,
   getNewsByDate,
+  getRecentNews,
   getPredictionsInRange,
   getLatestExternalProxy,
   getExternalProxyInRange,
@@ -58,9 +59,11 @@ import {
   computeAccuracy,
   reviewRecentPredictions,
 } from "./src/agent/stock/review/index.js";
-import { getReviewsInRange } from "./src/agent/stock/db/index.js";
+import { analyzeRecentPredictions } from "./src/agent/stock/review/analysis.js";
+import { getReviewsInRange, getAnalysesInRange } from "./src/agent/stock/db/index.js";
 import { listTargetIndexes, findIndexMeta } from "./src/agent/stock/providers/index.js";
 import { predictAllTargets, predictNextTradingDay } from "./src/agent/stock/prediction/index.js";
+import { classifyTodayNews } from "./src/agent/stock/news/index.js";
 import { getLhbActivity, getLhbForIndex } from "./src/agent/stock/providers/lhb.js";
 import {
   fetchQuoteWindow,
@@ -371,18 +374,55 @@ const queryLatestPrediction = tool(
       } catch {
         features = {};
       }
-      const pred = (features as { last_prediction?: { direction?: string; confidence?: number; rationale?: string; predicted_at?: string; based_on_trade_date?: string } }).last_prediction;
+      const pred = (features as {
+        last_prediction?: {
+          direction?: string;
+          confidence?: number;
+          rationale?: string;
+          predicted_at?: string;
+          based_on_trade_date?: string;
+          predicted_change_pct?: number;
+          predicted_change_pct_low?: number;
+          predicted_change_pct_high?: number;
+          magnitude_bucket?: string;
+          dimensions_used?: number;
+          signals?: Record<string, string>;
+        }
+      }).last_prediction;
       if (!pred?.direction) {
         out.push(`【${name}】 v${m.version}（as_of=${m.as_of_date}）记忆里没有保存方向；请用 run_prediction_now 触发一次新预测以获得方向。`);
         continue;
       }
       const dirText = pred.direction === "up" ? "买涨" : "买跌";
       const confText = pred.confidence == null ? "-" : (pred.confidence * 100).toFixed(1) + "%";
-      out.push(`【${name}】 下一交易日 → ${dirText}（置信度 ${confText}）`);
+      const pctText = pred.predicted_change_pct != null
+        ? (pred.predicted_change_pct >= 0 ? "+" : "") + pred.predicted_change_pct.toFixed(2) + "%"
+        : "-";
+      const rangeText = pred.predicted_change_pct_low != null && pred.predicted_change_pct_high != null
+        ? `[${(pred.predicted_change_pct_low >= 0 ? "+" : "") + pred.predicted_change_pct_low.toFixed(2)}%, ${(pred.predicted_change_pct_high >= 0 ? "+" : "") + pred.predicted_change_pct_high.toFixed(2)}%]`
+        : "-";
+      out.push(`【${name}】 下一交易日 → ${dirText}（置信度 ${confText}，预测 ${pctText}，区间 ${rangeText}）`);
       out.push(`  基于交易日: ${pred.based_on_trade_date ?? m.as_of_date}`);
       out.push(`  生成时间: ${pred.predicted_at ?? "-"}`);
       out.push(`  记忆版本: v${m.version}`);
-      out.push(`  理由: ${pred.rationale ?? "（无）"}`);
+      out.push(`  覆盖维度: ${pred.dimensions_used ?? "-"}/10`);
+      if (pred.rationale) {
+        out.push(`  理由: ${pred.rationale}`);
+      }
+      if (pred.signals && Object.keys(pred.signals).length > 0) {
+        const sigLines = Object.entries(pred.signals)
+          .map(([k, v]) => {
+            const labelMap: Record<string, string> = {
+              trend: "价格趋势", volume: "量能", fund_flow: "资金面",
+              breadth: "市场广度", sector: "板块轮动", lhb: "龙虎榜",
+              news: "新闻事件", macro: "宏观日历", external: "外资代理", futures: "股指期货",
+            };
+            const dirMap: Record<string, string> = { up: "偏多", down: "偏空", neutral: "中性", missing: "缺失" };
+            return `${labelMap[k] ?? k}: ${dirMap[v] ?? v}`;
+          })
+          .join(" / ");
+        out.push(`  各维度信号: ${sigLines}`);
+      }
     }
     out.push("");
     out.push("（仅供参考，非投资建议）");
@@ -390,7 +430,7 @@ const queryLatestPrediction = tool(
   },
   {
     name: "query_latest_prediction",
-    description: "查询指数智能体上一次给出的下一交易日方向（买涨/买跌）+ 置信度 + 理由 + 基于的交易日。**用户问'下一个交易日怎么走'/'买涨还是买跌'/'你预测什么'时优先使用此工具，禁止用 web_search 编方向**。留空 index 则两个都查。",
+    description: "查询指数智能体上一次给出的下一交易日方向（买涨/买跌）+ 置信度 + 理由 + 各维度信号 + 基于的交易日。**用户问'下一个交易日怎么走'/'买涨还是买跌'/'你预测什么'/'为什么这样判断'/'具体依据是什么'/'详细理由'时优先使用此工具，禁止用 web_search 编方向**。留空 index 则两个都查。",
     schema: z.object({ index: z.string().optional() }),
   }
 );
@@ -749,7 +789,7 @@ const SYSTEM_PROMPT = `你是一个全能智能助手，具备以下能力：
 3. **指数行情数据库（多信号）**: 你接管了 stock-index-agent 智能体生成的数据，可以回答上证指数和创业板指的历史行情、每日涨跌原因、长期分析记忆、下一交易日预测，以及 7 维度多信号数据。
    ## 价格行情维度
    - "最近行情/这周走势/某天为什么涨跌" → query_index_quotes / query_index_quote_by_date
-   - "下一交易日怎么走/买涨还是买跌/你的预测" → **先调用 query_latest_prediction**；提示"无方向/无记忆"时再 run_prediction_now
+   - "下一交易日怎么走/买涨还是买跌/你的预测/为什么这样判断/具体依据/详细理由" → **先调用 query_latest_prediction**；提示"无方向/无记忆"时再 run_prediction_now
    - "你对趋势的判断/分析记忆/summary" → query_index_memory
    - "有哪些数据/数据现状" → query_stock_overview
    ## 多信号维度
@@ -1182,6 +1222,57 @@ app.get("/api/stock/reviews", (req, res) => {
   }
 });
 
+// ==================== P3：AI 预测准确率分析 ====================
+//
+// - GET /api/stock/analysis        明细：列出 [start, end] 区间内每条预测的 AI 分析。
+// - POST /api/stock/analysis/refresh 手动触发最近 N 天的 AI 分析。
+
+app.get("/api/stock/analysis", (req, res) => {
+  const indexCode = String(req.query.indexCode ?? "");
+  const meta = findIndexMeta(indexCode);
+  if (!meta) {
+    res.status(400).json({ error: "unsupported indexCode" });
+    return;
+  }
+  const { start, end, days } = parseDaysQuery(req, 30);
+  try {
+    const rows = getAnalysesInRange(indexCode, start, end);
+    res.json({
+      indexCode,
+      indexName: meta.index_name,
+      start,
+      end,
+      days,
+      rows,
+    });
+  } catch (e) {
+    logStage({
+      stage: "analysis.query_failed",
+      ok: false,
+      indexCode,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    res.status(500).json({ error: "analysis query failed" });
+  }
+});
+
+app.post("/api/stock/analysis/refresh", async (req, res) => {
+  const days = Number(req.body?.days ?? req.query?.days ?? 90);
+  try {
+    const result = await analyzeRecentPredictions(
+      Number.isFinite(days) && days > 0 ? Math.min(365, days) : 90
+    );
+    res.json({ ok: true, analyzed: result.length });
+  } catch (e) {
+    logStage({
+      stage: "analysis_refresh.failed",
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    res.status(500).json({ error: "analysis refresh failed" });
+  }
+});
+
 // ==================== 多信号面板（P1 数据可视化）====================
 //
 // 把后端入库的所有多信号数据都暴露给前端，纯只读 JSON。
@@ -1259,8 +1350,8 @@ app.get("/api/stock/signals", (_req, res) => {
       lhb = { trade_date: asOfDate, total_count: 0, net_buy_total: 0, net_sell_total: 0, top_3_by_net_amount: [] };
     }
 
-    // 当日已分类新闻事件（前 15 条）
-    const news = getNewsByDate(asOfDate, 15);
+    // 最近已分类新闻事件（不限日期，前 30 条）
+    let news = getRecentNews(30);
 
     const payload: SignalsPayload = {
       asOfDate,
@@ -1445,6 +1536,22 @@ app.post("/api/stock/signals/refresh", async (req, res) => {
   } catch {
     result.macro = 0;
   }
+
+  // 新闻：用户主动刷新时应触发采集（LLM 分类，可能较慢，不阻塞响应）
+  // 新闻日期必须与行情日期对齐，避免行情未入库时新闻按今天分类导致面板查不到
+  (async () => {
+    try {
+      const quoteDate = getLatestQuote("000001.SH")?.trade_date ?? today;
+      await classifyTodayNews(quoteDate);
+    } catch (e) {
+      logStage({
+        stage: "signals_refresh.news_failed",
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  })();
+
   res.json({ ok: true, asOfDate: today, lhbDate, result });
 });
 

@@ -33,6 +33,7 @@ export type NewsCategory = z.infer<typeof NewsCategoryEnum>;
 
 const ImpactSchema = z.union([
   z.literal("broad"),
+  z.string().min(1),      // LLM 经常返回单个指数代码字符串，如 "000001.SH"
   z.array(z.string()).min(1),
 ]);
 
@@ -63,6 +64,7 @@ function getDefaultLlm(): ChatOpenAI {
     apiKey: process.env.KIMI_API_KEY,
     configuration: { baseURL: "https://api.moonshot.cn/v1" },
     temperature: 0.1,
+    maxTokens: 4096,
   });
   return _defaultLlm;
 }
@@ -75,29 +77,59 @@ async function defaultInvokeLlm(system: string, user: string): Promise<string> {
 
 export type WebSearchFn = (query: string) => Promise<string>;
 
-async function defaultWebSearch(query: string): Promise<string> {
-  const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+async function kimiWebSearch(query: string): Promise<string> {
+  const apiKey = process.env.KIMI_API_KEY;
+  if (!apiKey) return "";
   try {
-    const res = await fetch(url);
-    if (!res.ok) return "";
+    const res = await fetch("https://api.moonshot.cn/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "moonshot-v1-8k",
+        messages: [
+          {
+            role: "system",
+            content:
+              "你是一个搜索助手。请使用 web_search 工具搜索用户的问题，然后以纯文本列表形式返回搜索结果。每条结果一行，格式：标题 - 摘要（URL）。只输出结果列表，不要额外解释。",
+          },
+          { role: "user", content: query },
+        ],
+        tools: [{ type: "builtin_function", builtin_function: { name: "$web_search" } }],
+        temperature: 0.1,
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "<failed to read body>");
+      logStage({ stage: "news.kimi_http_failed", ok: false, query, status: res.status, body_preview: body.slice(0, 300) });
+      return "";
+    }
     const data = (await res.json()) as {
-      AbstractText?: string;
-      AbstractURL?: string;
-      RelatedTopics?: Array<{ Text?: string; FirstURL?: string }>;
-      Results?: Array<{ Text?: string; FirstURL?: string }>;
+      choices?: Array<{ message?: { content?: string } }>;
     };
-    const lines: string[] = [];
-    if (data.AbstractText) lines.push(`【摘要】${data.AbstractText} (${data.AbstractURL ?? ""})`);
-    for (const t of data.RelatedTopics ?? []) {
-      if (t.Text) lines.push(`【相关】${t.Text} (${t.FirstURL ?? ""})`);
-    }
-    for (const r of data.Results ?? []) {
-      if (r.Text) lines.push(`【结果】${r.Text} (${r.FirstURL ?? ""})`);
-    }
-    return lines.join("\n");
-  } catch {
+    const content = data.choices?.[0]?.message?.content ?? "";
+    logStage({ stage: "news.kimi_raw", ok: true, query, raw_length: content.length, raw_preview: content.slice(0, 300) });
+    // 尽量适配 extractHeadlines 的解析逻辑：把行包装成 【摘要】xxx 格式
+    const lines = content
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 6 && !l.startsWith("#") && !l.startsWith("-"));
+    const out = lines.map((l) => `【摘要】${l}`).join("\n");
+    logStage({ stage: "news.kimi_parsed", ok: true, query, lines: lines.length });
+    return out;
+  } catch (e) {
+    logStage({ stage: "news.kimi_search_failed", ok: false, query, error: e instanceof Error ? e.message : String(e) });
     return "";
   }
+}
+
+async function defaultWebSearch(query: string): Promise<string> {
+  // DDG 对中文财经查询基本不可用，每次白等 8 秒。直接走 Kimi 联网搜索。
+  logStage({ stage: "news.search_direct_kimi", ok: true, query });
+  return kimiWebSearch(query);
 }
 
 // ==================== Prompt ====================
@@ -118,12 +150,14 @@ const CLASSIFY_SYSTEM = `你是 A 股财经新闻分析助手。任务：对用�
 4) rationale ≤ 80 字中文，说明"为什么这条新闻会按此 sentiment 影响相应指数"
 5) 标题相近、本质同一事件的多条新闻 MUST 合并为一条（避免重复）
 6) 与 A 股关系不大的纯本地八卦/娱乐/体育 → category=other，sentiment=0
+7) 所有字符串值内部 MUST NOT 包含未转义的英文双引号（\"）。如果原文有引号，请删除或替换为中文引号「」。
+8) 优先保留与 A 股直接相关的国内财经/政策/行业新闻，海外新闻如无直接影响可省略。
 
 只输出 JSON，不要 Markdown 代码块。`;
 
 // ==================== Helpers ====================
 
-function safeParseJson<T>(raw: string, schema: z.ZodSchema<T>, fallback: T): T {
+function safeParseJson<T>(raw: string, schema: z.ZodSchema<T>, fallback: T, logCtx?: Record<string, unknown>): T {
   const trimmed = raw.trim();
   const candidates = [
     trimmed,
@@ -134,11 +168,53 @@ function safeParseJson<T>(raw: string, schema: z.ZodSchema<T>, fallback: T): T {
     if (!c) continue;
     try {
       return schema.parse(JSON.parse(c));
-    } catch {
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      logStage({ stage: "news.parse_json_attempt_failed", ok: false, attempt: candidates.indexOf(c) + 1, error: msg, ...logCtx });
       // try next
     }
   }
   return fallback;
+}
+
+/**
+ * 从可能被截断的 JSON 中提取完整的事件对象。
+ * LLM 输出被截断时，前面的事件对象通常是完整的。
+ */
+function extractEventsFromTruncatedJson(raw: string): ClassifiedItem[] {
+  const events: ClassifiedItem[] = [];
+  let depth = 0;
+  let start = -1;
+
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (c === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (c === "}") {
+      depth--;
+      if (depth === 0 && start !== -1) {
+        try {
+          const obj = JSON.parse(raw.slice(start, i + 1));
+          if (obj.title && NewsCategoryEnum.safeParse(obj.category).success) {
+            events.push({
+              title: String(obj.title),
+              summary: obj.summary ?? null,
+              category: NewsCategoryEnum.parse(obj.category),
+              sentiment: typeof obj.sentiment === "number" ? Math.max(-1, Math.min(1, obj.sentiment)) : 0,
+              impact_indices: obj.impact_indices ?? "broad",
+              rationale: obj.rationale ? String(obj.rationale) : "未提供理由",
+            });
+          }
+        } catch {
+          // skip invalid object
+        }
+        start = -1;
+      }
+    }
+  }
+
+  return events;
 }
 
 interface RawHeadline {
@@ -168,12 +244,36 @@ function extractHeadlines(searchText: string, source: string): RawHeadline[] {
   return out;
 }
 
+/** 抓取新浪财经最新要闻（国内可直接访问）。 */
+async function fetchSinaNews(limit = 15): Promise<RawHeadline[]> {
+  const url = `https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516&k=&num=${limit}&page=1&r=${Date.now()}`;
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) return [];
+    const data = (await res.json()) as {
+      result?: { data?: Array<{ title?: string; url?: string; intro?: string }> };
+    };
+    const items = data.result?.data ?? [];
+    const out: RawHeadline[] = [];
+    for (const item of items) {
+      const title = item.title?.trim();
+      if (title && title.length >= 6 && title.length < 200) {
+        out.push({ title, url: item.url, source: "sina_finance" });
+      }
+    }
+    return out;
+  } catch (e) {
+    logStage({ stage: "news.sina_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
+    return [];
+  }
+}
+
 // ==================== 主流程 ====================
 
 export interface ClassifyOptions {
   llmInvoke?: LlmInvokeFn;
   webSearch?: WebSearchFn;
-  /** 自定义关键词，否则使用默认 3 组 */
+  /** 自定义关键词，否则使用默认 4 组 */
   queries?: string[];
 }
 
@@ -181,6 +281,7 @@ const DEFAULT_QUERIES = [
   "今日 A股 财经 重大政策",
   "今日 央行 货币政策 经济数据",
   "今日 半导体 AI 新能源 新闻",
+  "今日 国际局势 地缘政治 全球财经",
 ];
 
 export interface ClassifyResult {
@@ -191,7 +292,38 @@ export interface ClassifyResult {
   search_failed_count: number;
 }
 
+/** 当日已分类结果的简单内存缓存，避免同一进程内重复搜索+LLM。 */
+const _cache = new Map<string, ClassifyResult>();
+/** 同日期并发调用共享一个 in-flight Promise，防止多个请求同时搜同样的关键词。 */
+const _inflight = new Map<string, Promise<ClassifyResult>>();
+
 export async function classifyTodayNews(
+  asOfDate: string,
+  opts: ClassifyOptions = {}
+): Promise<ClassifyResult> {
+  // 0) 同日期缓存命中直接返回
+  const cached = _cache.get(asOfDate);
+  if (cached) {
+    logStage({ stage: "news.classify_cache_hit", ok: true, asOfDate });
+    return cached;
+  }
+
+  // 0b) 同日期有正在执行的调用，直接复用其 Promise
+  const existing = _inflight.get(asOfDate);
+  if (existing) return existing;
+
+  const promise = _classifyTodayNewsImpl(asOfDate, opts);
+  _inflight.set(asOfDate, promise);
+  try {
+    const result = await promise;
+    _cache.set(asOfDate, result);
+    return result;
+  } finally {
+    _inflight.delete(asOfDate);
+  }
+}
+
+async function _classifyTodayNewsImpl(
   asOfDate: string,
   opts: ClassifyOptions = {}
 ): Promise<ClassifyResult> {
@@ -205,23 +337,40 @@ export async function classifyTodayNews(
   const search = opts.webSearch ?? defaultWebSearch;
   const queries = opts.queries ?? DEFAULT_QUERIES;
 
-  // 1) 抓多组关键词
+  // 1) 并行抓多组关键词 + 新浪财经兜底
+  const searchStart = Date.now();
+  const [searchResults, sinaHeadlines] = await Promise.all([
+    Promise.all(
+      queries.map(async (q) => {
+        try {
+          const txt = await search(q);
+          return { ok: true as const, query: q, txt };
+        } catch (e) {
+          result.search_failed_count += 1;
+          logStage({
+            stage: "news.search_failed",
+            ok: false,
+            query: q,
+            error: e instanceof Error ? e.message : String(e),
+          });
+          return { ok: false as const, query: q, txt: "" };
+        }
+      })
+    ),
+    fetchSinaNews(15).catch((e) => {
+      logStage({ stage: "news.sina_fetch_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
+      return [] as RawHeadline[];
+    }),
+  ]);
+
   const headlines: RawHeadline[] = [];
-  for (const q of queries) {
-    let txt = "";
-    try {
-      txt = await search(q);
-    } catch (e) {
-      result.search_failed_count += 1;
-      logStage({
-        stage: "news.search_failed",
-        ok: false,
-        query: q,
-        error: e instanceof Error ? e.message : String(e),
-      });
+  for (const r of searchResults) {
+    if (r.ok) {
+      headlines.push(...extractHeadlines(r.txt, `web_search:ddg:${r.query}`));
     }
-    headlines.push(...extractHeadlines(txt, `web_search:ddg:${q}`));
   }
+  headlines.push(...sinaHeadlines);
+  logStage({ stage: "news.sina_fetched", ok: true, count: sinaHeadlines.length, elapsed_ms: Date.now() - searchStart });
 
   // 去重（按 title）
   const dedup: RawHeadline[] = [];
@@ -281,14 +430,39 @@ export async function classifyTodayNews(
     });
   }
 
-  const parsed = safeParseJson(raw, ClassificationOutputSchema, { events: [] });
+  // 调试：记录 LLM 原始输出，帮助诊断 events 为空的问题
+  if (raw) {
+    logStage({
+      stage: "news.llm_classify_raw",
+      ok: true,
+      asOfDate,
+      raw_length: raw.length,
+      raw_preview: raw.slice(0, 500),
+    });
+  }
+
+  let parsed = safeParseJson(raw, ClassificationOutputSchema, { events: [] }, { asOfDate, raw_length: raw.length });
+
+  // 如果完整解析失败且 events 为空，尝试从截断 JSON 中提取部分事件
+  if (parsed.events.length === 0 && raw.length > 50) {
+    const repaired = extractEventsFromTruncatedJson(raw);
+    if (repaired.length > 0) {
+      logStage({ stage: "news.parse_truncated_repair", ok: true, extracted: repaired.length, asOfDate });
+      parsed = { events: repaired };
+    }
+  }
 
   // 3) 写库
   for (const ev of parsed.events) {
-    const impact_str =
-      typeof ev.impact_indices === "string"
-        ? ev.impact_indices
-        : JSON.stringify(ev.impact_indices);
+    let impact_str: string;
+    if (ev.impact_indices === "broad") {
+      impact_str = "broad";
+    } else if (typeof ev.impact_indices === "string") {
+      // LLM 返回了单个指数代码字符串，包装成数组存储
+      impact_str = JSON.stringify([ev.impact_indices]);
+    } else {
+      impact_str = JSON.stringify(ev.impact_indices);
+    }
     const ok = insertNewsEventIfAbsent({
       as_of_date: asOfDate,
       source: dedup.find((d) => d.title === ev.title)?.source ?? "web_search:ddg",
@@ -306,6 +480,13 @@ export async function classifyTodayNews(
 
   // 如果 LLM 完全没分到事件，也写一条兜底
   if (parsed.events.length === 0 && !result.llm_failed) {
+    logStage({
+      stage: "news.llm_empty_events",
+      ok: true,
+      asOfDate,
+      note: "LLM returned valid JSON with empty events array",
+      candidate_count: dedup.length,
+    });
     const ok = insertNewsEventIfAbsent({
       as_of_date: asOfDate,
       source: "fallback",

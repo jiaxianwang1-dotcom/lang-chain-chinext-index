@@ -305,11 +305,10 @@
     `;
   }
 
-  // ============ 渲染：当日新闻事件 ============
+  // ============ 渲染：新闻事件（不限当日，含日期列，创业板高亮）============
   function renderNews(events) {
-    if (!events || events.length === 0) return emptyHint("当日无已分类新闻事件");
+    if (!events || events.length === 0) return emptyHint("暂无已分类新闻事件");
     return events
-      .slice(0, 10)
       .map((e) => {
         const sentLabel =
           e.sentiment == null
@@ -321,11 +320,14 @@
             : "neutral";
         const sentText =
           e.sentiment == null ? "0" : (e.sentiment >= 0 ? "+" : "") + e.sentiment.toFixed(2);
+        const isChiNext =
+          e.impact_indices === "broad" ||
+          (e.impact_indices && e.impact_indices.includes("399006.SZ"));
         return `
-          <div class="sig-news-item">
+          <div class="sig-news-item ${isChiNext ? "chi-next" : ""}">
             <div class="sig-news-head">
               <span class="sig-tag ${sentLabel}">${escapeHtml(sentText)}</span>
-              <span style="font-size:11px;color:#888;">[${escapeHtml(e.category || "other")}] ${escapeHtml(e.impact_indices || "broad")}</span>
+              <span style="font-size:11px;color:#888;">${escapeHtml(e.as_of_date ?? "-")} · [${escapeHtml(e.category || "other")}] ${escapeHtml(e.impact_indices || "broad")}</span>
             </div>
             <div class="sig-news-title">${escapeHtml(e.title)}</div>
             ${e.rationale ? `<div class="sig-news-rationale">↳ ${escapeHtml(e.rationale.slice(0, 120))}</div>` : ""}
@@ -375,8 +377,8 @@
         body: renderLhb(payload.lhb),
       },
       {
-        title: "当日新闻事件",
-        hint: "已分类",
+        title: "新闻事件",
+        hint: "近期已分类",
         body: renderNews(payload.news),
       },
     ];

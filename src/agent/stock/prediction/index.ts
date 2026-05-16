@@ -24,7 +24,7 @@ import {
 import { findIndexMeta, listTargetIndexes } from "../providers/index.js";
 import { getLhbForIndex } from "../providers/lhb.js";
 import { computeAnomalySignals, type AnomalySignals } from "../signals/index.js";
-import { getTodayNewsEvents } from "../news/index.js";
+import { getTodayNewsEvents, classifyTodayNews } from "../news/index.js";
 import { getMacroEventsAround, ensureRecentMacroSeed } from "../providers/macro.js";
 import { logStage } from "../utils/log.js";
 
@@ -860,6 +860,21 @@ export async function predictNextTradingDay(
   // === 旧版单维度路径（仅用于回归测试 / 显式降级）===
   if (!useMulti) {
     return predictDirectLegacy(indexCode, opts, windowDays);
+  }
+
+  // 预测前若当日新闻为空，自动触发采集（非交易日/首次运行时常缺失）
+  const latestQuote = getLatestQuote(indexCode);
+  if (latestQuote) {
+    const tradeDate = latestQuote.trade_date;
+    const existingNews = getTodayNewsEvents(tradeDate, 1);
+    if (existingNews.length === 0) {
+      logStage({ stage: "predict.news_empty_auto_classify", ok: true, indexCode, tradeDate });
+      try {
+        await classifyTodayNews(tradeDate);
+      } catch (e) {
+        logStage({ stage: "predict.news_auto_classify_failed", ok: false, indexCode, tradeDate, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
   }
 
   const ctx = gatherMultiSignalContext(indexCode, windowDays);

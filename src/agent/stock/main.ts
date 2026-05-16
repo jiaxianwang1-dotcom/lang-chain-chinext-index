@@ -7,6 +7,7 @@ import { backfillReasons } from "./analysis/index.js";
 import { runOnce } from "./graph/index.js";
 import { predictAllTargets } from "./prediction/index.js";
 import { buildNotifier } from "./notify/index.js";
+import { reviewRecentPredictions } from "./review/index.js";
 import { logStage, timed } from "./utils/log.js";
 
 // LangSmith：默认覆盖为本智能体专属项目
@@ -113,10 +114,33 @@ async function main(): Promise<void> {
   task.start();
   logStage({ stage: "cron.registered", ok: true, expr: "0 14 * * 1-5", tz: "Asia/Shanghai" });
 
+  // 北京时间每个交易日 16:00 触发盘后回顾 + AI 准确率分析
+  const reviewTask = cron.schedule(
+    "0 16 * * 1-5",
+    async () => {
+      try {
+        logStage({ stage: "cron.review_start", ok: true });
+        // reviewRecentPredictions 已内置自动触发 AI 分析
+        reviewRecentPredictions(90);
+        logStage({ stage: "cron.review_done", ok: true });
+      } catch (e) {
+        logStage({
+          stage: "cron.review_failed",
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    },
+    { timezone: "Asia/Shanghai" }
+  );
+  reviewTask.start();
+  logStage({ stage: "cron.review_registered", ok: true, expr: "0 16 * * 1-5", tz: "Asia/Shanghai" });
+
   // 防止进程退出
   process.on("SIGINT", () => {
     logStage({ stage: "shutdown", ok: true, signal: "SIGINT" });
     task.stop();
+    reviewTask.stop();
     process.exit(0);
   });
 }

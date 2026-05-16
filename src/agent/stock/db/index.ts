@@ -28,6 +28,7 @@ const PREDICTION_EXTRA_COLUMNS: Array<[string, string]> = [
   ["magnitude_bucket", "TEXT"], // "small" | "medium" | "large"
   ["dimensions_used", "INTEGER"],
   ["signals_json", "TEXT"],
+  ["prompt_text", "TEXT"],
 ];
 
 function ensureColumn(db: Database.Database, table: string, col: string, def: string): void {
@@ -251,6 +252,21 @@ export function getDb(): Database.Database {
       PRIMARY KEY (index_code, target_date)
     );
     CREATE INDEX IF NOT EXISTS idx_review_code_date ON prediction_review(index_code, target_date DESC);
+
+    -- ============ P3：AI 预测准确率分析 ============
+    CREATE TABLE IF NOT EXISTS prediction_analysis (
+      index_code        TEXT NOT NULL,
+      target_date       TEXT NOT NULL,
+      is_accurate       INTEGER,            -- 1=准确 / 0=不准确
+      analysis_summary  TEXT,               -- AI 分析的摘要
+      key_factors       TEXT,               -- 关键影响因子 JSON
+      missed_signals    TEXT,               -- 被忽视的信号 JSON
+      prompt_snapshot   TEXT,               -- 预测时的 prompt 摘要
+      model             TEXT,               -- 分析所用模型
+      analyzed_at       TEXT NOT NULL,
+      PRIMARY KEY (index_code, target_date)
+    );
+    CREATE INDEX IF NOT EXISTS idx_analysis_code_date ON prediction_analysis(index_code, target_date DESC);
   `);
 
   // 给已经存在的 index_quotes 表补齐 OHLCV 列（向前迁移，幂等）
@@ -791,6 +807,17 @@ export function getNewsByDate(date: string, limit = 20): NewsEventRow[] {
     .all(date, limit) as NewsEventRow[];
 }
 
+export function getRecentNews(limit = 30): NewsEventRow[] {
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT * FROM news_event
+       ORDER BY as_of_date DESC, id DESC
+       LIMIT ?`
+    )
+    .all(limit) as NewsEventRow[];
+}
+
 // ==================== AI 涨跌幅预测 CRUD ====================
 
 export type MagnitudeBucket = "small" | "medium" | "large";
@@ -816,6 +843,8 @@ export interface IndexPredictionRow {
   dimensions_used?: number | null;
   /** P0：每维度倾向 JSON，如 {trend:"up", volume:"down", ...}。*/
   signals_json?: string | null;
+  /** P3：预测时的完整 prompt 文本。*/
+  prompt_text?: string | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -842,6 +871,7 @@ export function upsertPrediction(row: IndexPredictionRow): IndexPredictionRow {
            magnitude_bucket = ?,
            dimensions_used = ?,
            signals_json = ?,
+           prompt_text = ?,
            updated_at = ?
        WHERE id = ?`
     ).run(
@@ -857,6 +887,7 @@ export function upsertPrediction(row: IndexPredictionRow): IndexPredictionRow {
       row.magnitude_bucket ?? null,
       row.dimensions_used ?? null,
       row.signals_json ?? null,
+      row.prompt_text ?? null,
       now,
       existing.id
     );
@@ -869,9 +900,9 @@ export function upsertPrediction(row: IndexPredictionRow): IndexPredictionRow {
        (index_code, target_date, predicted_change_pct, direction, confidence,
         rationale, model, based_on_date, predicted_at,
         predicted_change_pct_low, predicted_change_pct_high,
-        magnitude_bucket, dimensions_used, signals_json,
+        magnitude_bucket, dimensions_used, signals_json, prompt_text,
         created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       row.index_code,
@@ -888,6 +919,7 @@ export function upsertPrediction(row: IndexPredictionRow): IndexPredictionRow {
       row.magnitude_bucket ?? null,
       row.dimensions_used ?? null,
       row.signals_json ?? null,
+      row.prompt_text ?? null,
       now,
       now
     );
@@ -1170,6 +1202,72 @@ export function getReview(indexCode: string, targetDate: string): PredictionRevi
   );
 }
 
+// ==================== P3: 预测准确率分析 CRUD ====================
+
+export interface PredictionAnalysisRow {
+  index_code: string;
+  target_date: string;
+  is_accurate: 0 | 1 | null;
+  analysis_summary: string | null;
+  key_factors: string | null;
+  missed_signals: string | null;
+  prompt_snapshot: string | null;
+  model: string | null;
+  analyzed_at: string;
+}
+
+export function upsertAnalysis(row: PredictionAnalysisRow): void {
+  const db = getDb();
+  db.prepare(
+    `INSERT INTO prediction_analysis
+     (index_code, target_date, is_accurate, analysis_summary,
+      key_factors, missed_signals, prompt_snapshot, model, analyzed_at)
+     VALUES (?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(index_code, target_date) DO UPDATE SET
+       is_accurate=excluded.is_accurate,
+       analysis_summary=excluded.analysis_summary,
+       key_factors=excluded.key_factors,
+       missed_signals=excluded.missed_signals,
+       prompt_snapshot=excluded.prompt_snapshot,
+       model=excluded.model,
+       analyzed_at=excluded.analyzed_at`
+  ).run(
+    row.index_code,
+    row.target_date,
+    row.is_accurate,
+    row.analysis_summary,
+    row.key_factors,
+    row.missed_signals,
+    row.prompt_snapshot,
+    row.model,
+    row.analyzed_at
+  );
+}
+
+export function getAnalysis(indexCode: string, targetDate: string): PredictionAnalysisRow | null {
+  const db = getDb();
+  return (
+    (db
+      .prepare("SELECT * FROM prediction_analysis WHERE index_code = ? AND target_date = ?")
+      .get(indexCode, targetDate) as PredictionAnalysisRow | undefined) ?? null
+  );
+}
+
+export function getAnalysesInRange(
+  indexCode: string,
+  startDate: string,
+  endDate: string
+): PredictionAnalysisRow[] {
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT * FROM prediction_analysis
+       WHERE index_code = ? AND target_date >= ? AND target_date <= ?
+       ORDER BY target_date ASC`
+    )
+    .all(indexCode, startDate, endDate) as PredictionAnalysisRow[];
+}
+
 // ==================== 测试辅助 ====================
 
 /** 仅用于测试：重新打开一个独立 DB 实例（不影响默认 _db）。*/
@@ -1262,6 +1360,7 @@ export function openDbForTest(path: string): Database.Database {
       predicted_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
       predicted_change_pct_low REAL, predicted_change_pct_high REAL,
       magnitude_bucket TEXT, dimensions_used INTEGER, signals_json TEXT,
+      prompt_text TEXT,
       UNIQUE(index_code, target_date)
     );
 
@@ -1290,6 +1389,14 @@ export function openDbForTest(path: string): Database.Database {
       actual_pct REAL, actual_direction TEXT,
       direction_hit INTEGER, range_hit INTEGER, pct_abs_error REAL,
       reviewed_at TEXT NOT NULL,
+      PRIMARY KEY (index_code, target_date)
+    );
+    CREATE TABLE IF NOT EXISTS prediction_analysis (
+      index_code TEXT NOT NULL, target_date TEXT NOT NULL,
+      is_accurate INTEGER, analysis_summary TEXT,
+      key_factors TEXT, missed_signals TEXT,
+      prompt_snapshot TEXT, model TEXT,
+      analyzed_at TEXT NOT NULL,
       PRIMARY KEY (index_code, target_date)
     );
   `);

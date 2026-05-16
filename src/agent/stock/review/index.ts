@@ -8,6 +8,7 @@ import {
 } from "../db/index.js";
 import { findIndexMeta, listTargetIndexes } from "../providers/index.js";
 import { logStage } from "../utils/log.js";
+import { analyzePredictionsForIndex, type AnalyzeOptions } from "./analysis.js";
 
 /**
  * 预测回顾（P2-6 实现）。
@@ -138,8 +139,9 @@ export function reviewPredictionsForIndex(
 
 /**
  * 回顾所有目标指数最近 N 天的预测，默认 90 天。
+ * 回顾完成后自动触发 AI 准确率分析（不阻塞返回）。
  */
-export function reviewRecentPredictions(days = 90): ReviewBuildResult[] {
+export function reviewRecentPredictions(days = 90, opts?: { analyze?: boolean; analyzeOpts?: AnalyzeOptions }): ReviewBuildResult[] {
   const end = new Date();
   const start = new Date(end);
   start.setUTCDate(start.getUTCDate() - days);
@@ -149,6 +151,25 @@ export function reviewRecentPredictions(days = 90): ReviewBuildResult[] {
   for (const meta of listTargetIndexes()) {
     out.push(reviewPredictionsForIndex(meta.index_code, startStr, endStr));
   }
+
+  // 自动触发 AI 分析（fire-and-forget，不阻塞 review 返回）
+  if (opts?.analyze !== false) {
+    const analyzeOpts = opts?.analyzeOpts;
+    (async () => {
+      try {
+        for (const meta of listTargetIndexes()) {
+          await analyzePredictionsForIndex(meta.index_code, startStr, endStr, analyzeOpts);
+        }
+      } catch (e) {
+        logStage({
+          stage: "review.auto_analysis_failed",
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    })();
+  }
+
   return out;
 }
 
