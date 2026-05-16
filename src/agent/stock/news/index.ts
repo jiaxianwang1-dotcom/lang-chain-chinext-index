@@ -181,7 +181,8 @@ async function kimiWebSearch(query: string): Promise<string> {
     const lines = content
       .split("\n")
       .map((l) => l.trim())
-      .filter((l) => l.length > 6 && !l.startsWith("#") && !l.startsWith("-"));
+      .filter((l) => l.length > 6 && !l.startsWith("#"))
+      .map((l) => l.replace(/^[-•*]\s+/, "")); // 去掉列表标记
     const out = lines.map((l) => `【摘要】${l}`).join("\n");
     logStage({ stage: "news.kimi_parsed", ok: true, query, lines: lines.length });
     return out;
@@ -313,8 +314,18 @@ function extractHeadlines(searchText: string, source: string): RawHeadline[] {
 async function fetchSinaNews(limit = 15): Promise<RawHeadline[]> {
   const url = `https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516&k=&num=${limit}&page=1&r=${Date.now()}`;
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-    if (!res.ok) return [];
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(10000),
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Referer: "https://finance.sina.com.cn/",
+        Accept: "application/json, text/plain, */*",
+      },
+    });
+    if (!res.ok) {
+      logStage({ stage: "news.sina_http_failed", ok: false, status: res.status });
+      return [];
+    }
     const data = (await res.json()) as {
       result?: { data?: Array<{ title?: string; url?: string; intro?: string }> };
     };
@@ -326,6 +337,7 @@ async function fetchSinaNews(limit = 15): Promise<RawHeadline[]> {
         out.push({ title, url: item.url, source: "sina_finance" });
       }
     }
+    logStage({ stage: "news.sina_ok", ok: true, count: out.length });
     return out;
   } catch (e) {
     logStage({ stage: "news.sina_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
