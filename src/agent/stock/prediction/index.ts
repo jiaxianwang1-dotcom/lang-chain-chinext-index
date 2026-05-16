@@ -174,7 +174,9 @@ date / open / high / low / close / chg% / volume / reason
    禁止泛泛之词如"震荡上行""市场情绪改善"。
 4) 严格输出 JSON：{"direction":"up","confidence":0.xx,"rationale":"..."}。不要 Markdown，不要解释字段。`;
 
-export const PREDICT_MULTI_SIGNAL_SYSTEM = `你是 A 股大盘短线方向 + 涨跌幅判断助手（多信号模式 v2）。
+export function buildMultiSignalSystemPrompt(indexName = "大盘"): string {
+  const prefix = indexName === "上证指数" || indexName === "大盘" ? "A 股大盘" : indexName;
+  return `你是 ${prefix}短线方向 + 涨跌幅判断助手（多信号模式 v2）。
 
 你将收到 **最多 10 个维度**的真实数据用于分析"下一交易日"方向（"up"=买涨 / "down"=买跌）以及预测涨跌幅区间：
 
@@ -219,7 +221,7 @@ H. **magnitude_bucket**: 按 |predicted_change_pct| 判档位：
 ============ "异动信号"专项提醒 ============
 
 - 量比 > 1.5 + 当日 |chg%| < 1.0 → "高量低波"，可能有人在静默吸筹/出货，需结合龙虎榜判断方向
-- 量比 > 1.5 + 大盘明显上行 → 放量上行，趋势加强信号
+- 量比 > 1.5 + 指数明显上行 → 放量上行，趋势加强信号
 - 量比 < 0.7 + 微跌 → 缩量调整，下跌动能不足
 - 龙虎榜净买入 > 50 亿（全市场成分） + 集中某板块 → 机构看好该板块，与维度 5 行业轮动交叉验证
 - 期货深度贴水（IF/IC basis_pct < -0.8%）→ 机构悲观，倾向下行
@@ -254,6 +256,9 @@ H. **magnitude_bucket**: 按 |predicted_change_pct| 判档位：
 }
 
 signals 中每个维度必须真实反映你对该维度的判断；data 缺失时填 "missing"。`;
+}
+
+export const PREDICT_MULTI_SIGNAL_SYSTEM = buildMultiSignalSystemPrompt();
 
 // ==================== Helpers ====================
 
@@ -916,7 +921,7 @@ export async function predictNextTradingDay(
   const llmInvoke = opts.llmInvoke ?? defaultInvokeLlm;
   let raw = "";
   try {
-    raw = await llmInvoke(PREDICT_MULTI_SIGNAL_SYSTEM, userPrompt);
+    raw = await llmInvoke(buildMultiSignalSystemPrompt(ctx.indexName), userPrompt);
   } catch (e) {
     logStage({
       stage: "predict.llm_failed",

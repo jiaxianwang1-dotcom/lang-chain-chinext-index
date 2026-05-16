@@ -13,7 +13,7 @@ import { logStage } from "../utils/log.js";
 import {
   gatherMultiSignalContext,
   normalizeMultiSignalPrediction,
-  PREDICT_MULTI_SIGNAL_SYSTEM,
+  buildMultiSignalSystemPrompt,
   buildMultiSignalUserPrompt,
   safeParseMultiSignal,
   type MultiSignalPrediction,
@@ -170,7 +170,7 @@ export async function predictChangePctForTarget(
   const llmInvoke = opts.llmInvoke ?? defaultInvokeLlm;
   let raw = "";
   try {
-    raw = await llmInvoke(PREDICT_MULTI_SIGNAL_SYSTEM, userPrompt);
+    raw = await llmInvoke(buildMultiSignalSystemPrompt(meta.index_name), userPrompt);
   } catch (e) {
     logStage({
       stage: "predict_card.llm_failed",

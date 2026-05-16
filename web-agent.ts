@@ -55,7 +55,7 @@ import {
   predictChangePctForTarget,
   decideCardTarget,
 } from "./src/agent/stock/prediction/realtime-card.js";
-import { PREDICT_MULTI_SIGNAL_SYSTEM } from "./src/agent/stock/prediction/index.js";
+import { buildMultiSignalSystemPrompt } from "./src/agent/stock/prediction/index.js";
 import {
   computeAllAccuracy,
   computeAccuracy,
@@ -1144,7 +1144,7 @@ app.get("/api/stock/predictions/card", async (req, res) => {
       label: target.label,
       isTodayTradingDay,
       prediction,
-      systemPrompt: PREDICT_MULTI_SIGNAL_SYSTEM,
+      systemPrompt: buildMultiSignalSystemPrompt(meta.index_name),
       userPrompt: prediction.prompt_text ?? null,
     });
   } catch (e) {
