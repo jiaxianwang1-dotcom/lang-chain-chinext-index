@@ -1552,7 +1552,7 @@ app.post("/api/stock/signals/refresh", async (req, res) => {
   (async () => {
     try {
       const quoteDate = getLatestQuote("000001.SH")?.trade_date ?? today;
-      await classifyTodayNews(quoteDate);
+      await classifyTodayNews(quoteDate, { force: true });
     } catch (e) {
       logStage({
         stage: "signals_refresh.news_failed",

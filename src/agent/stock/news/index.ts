@@ -340,6 +340,8 @@ export interface ClassifyOptions {
   webSearch?: WebSearchFn;
   /** 自定义关键词，否则使用默认 4 组 */
   queries?: string[];
+  /** 强制跳过缓存重新搜索+分类 */
+  force?: boolean;
 }
 
 const DEFAULT_QUERIES = [
@@ -366,16 +368,20 @@ export async function classifyTodayNews(
   asOfDate: string,
   opts: ClassifyOptions = {}
 ): Promise<ClassifyResult> {
-  // 0) 同日期缓存命中直接返回
-  const cached = _cache.get(asOfDate);
-  if (cached) {
-    logStage({ stage: "news.classify_cache_hit", ok: true, asOfDate });
-    return cached;
+  // 0) 同日期缓存命中直接返回（force 模式跳过缓存）
+  if (!opts.force) {
+    const cached = _cache.get(asOfDate);
+    if (cached) {
+      logStage({ stage: "news.classify_cache_hit", ok: true, asOfDate });
+      return cached;
+    }
   }
 
-  // 0b) 同日期有正在执行的调用，直接复用其 Promise
-  const existing = _inflight.get(asOfDate);
-  if (existing) return existing;
+  // 0b) 同日期有正在执行的调用，直接复用其 Promise（force 模式也等当前执行完，避免并发轰炸）
+  if (!opts.force) {
+    const existing = _inflight.get(asOfDate);
+    if (existing) return existing;
+  }
 
   const promise = _classifyTodayNewsImpl(asOfDate, opts);
   _inflight.set(asOfDate, promise);
