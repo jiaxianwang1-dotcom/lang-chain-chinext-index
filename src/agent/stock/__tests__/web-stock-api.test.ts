@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
 
-// 必须在 import web-agent 之前设置环境变量，避免它启动 listen + 读 ZHIPU_API_KEY 时崩。
+// 必须在 import web-agent 之前设置环境变量，避免它启动 listen + 读 KIMI_API_KEY 时崩。
 process.env.WEB_AGENT_NO_LISTEN = "1";
-process.env.ZHIPU_API_KEY ??= "test-key";
+process.env.KIMI_API_KEY ??= "test-key";
 process.env.PORT ??= "0";
 
 // Mock 数据源：把 defaultProvider 替换成可控的 mock，避免真实网络。

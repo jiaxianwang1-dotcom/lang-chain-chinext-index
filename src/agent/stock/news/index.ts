@@ -9,7 +9,7 @@ import { logStage } from "../utils/log.js";
  *
  * 原则：
  * - 不做常驻爬虫（财联社/东方财富 7x24 反爬严重）
- * - 预测前按需调用 webSearch 抓最近热点，传给 glm-4-flash 做结构化分类
+ * - 预测前按需调用 webSearch 抓最近热点，传给 moonshot-v1-32k 做结构化分类
  * - 失败时写空兜底，不阻塞预测主流程
  */
 
@@ -59,9 +59,9 @@ let _defaultLlm: ChatOpenAI | null = null;
 function getDefaultLlm(): ChatOpenAI {
   if (_defaultLlm) return _defaultLlm;
   _defaultLlm = new ChatOpenAI({
-    model: "glm-4-flash",
-    apiKey: process.env.ZHIPU_API_KEY,
-    configuration: { baseURL: "https://open.bigmodel.cn/api/paas/v4" },
+    model: "moonshot-v1-32k",
+    apiKey: process.env.KIMI_API_KEY,
+    configuration: { baseURL: "https://api.moonshot.cn/v1" },
     temperature: 0.1,
   });
   return _defaultLlm;

@@ -29,9 +29,9 @@ let _defaultLlm: ChatOpenAI | null = null;
 function getDefaultLlm(): ChatOpenAI {
   if (_defaultLlm) return _defaultLlm;
   _defaultLlm = new ChatOpenAI({
-    model: "glm-4-flash",
-    apiKey: process.env.ZHIPU_API_KEY,
-    configuration: { baseURL: "https://open.bigmodel.cn/api/paas/v4" },
+    model: "moonshot-v1-32k",
+    apiKey: process.env.KIMI_API_KEY,
+    configuration: { baseURL: "https://api.moonshot.cn/v1" },
     temperature: 0.2,
   });
   return _defaultLlm;

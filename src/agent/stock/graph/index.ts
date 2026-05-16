@@ -158,9 +158,9 @@ let _llm: ChatOpenAI | null = null;
 function getLlm(): ChatOpenAI {
   if (_llm) return _llm;
   _llm = new ChatOpenAI({
-    model: "glm-4-flash",
-    apiKey: process.env.ZHIPU_API_KEY,
-    configuration: { baseURL: "https://open.bigmodel.cn/api/paas/v4" },
+    model: "moonshot-v1-32k",
+    apiKey: process.env.KIMI_API_KEY,
+    configuration: { baseURL: "https://api.moonshot.cn/v1" },
     temperature: 0.2,
   });
   return _llm;

@@ -32,7 +32,7 @@ export interface CardTargetInfo {
   label: string;
 }
 
-const MODEL_TAG = "glm-4-flash";
+const MODEL_TAG = "moonshot-v1-32k";
 
 // ==================== 时间 / 交易日工具 ====================
 
@@ -88,8 +88,8 @@ function getDefaultLlm(): ChatOpenAI {
   if (_defaultLlm) return _defaultLlm;
   _defaultLlm = new ChatOpenAI({
     model: MODEL_TAG,
-    apiKey: process.env.ZHIPU_API_KEY,
-    configuration: { baseURL: "https://open.bigmodel.cn/api/paas/v4" },
+    apiKey: process.env.KIMI_API_KEY,
+    configuration: { baseURL: "https://api.moonshot.cn/v1" },
     temperature: 0.2,
   });
   return _defaultLlm;
@@ -180,6 +180,17 @@ export async function predictChangePctForTarget(
     });
   }
 
+  // 调试：记录 LLM 原始输出，方便排查解析失败
+  if (raw) {
+    logStage({
+      stage: "predict_card.llm_raw",
+      indexCode,
+      ok: true,
+      raw_length: raw.length,
+      raw_preview: raw.slice(0, 200),
+    });
+  }
+
   // 兜底
   const lastDay = ctx.recent30[ctx.recent30.length - 1];
   const lastPct = lastDay.change_pct ?? 0;
@@ -205,6 +216,14 @@ export async function predictChangePctForTarget(
     },
   };
   const parsed = raw ? safeParseMultiSignal(raw, fallback) : fallback;
+  if (parsed === fallback && raw) {
+    logStage({
+      stage: "predict_card.parse_failed",
+      indexCode,
+      ok: false,
+      raw_preview: raw.slice(0, 300),
+    });
+  }
   const norm = normalizeMultiSignalPrediction(parsed);
 
   const saved = upsertPrediction({

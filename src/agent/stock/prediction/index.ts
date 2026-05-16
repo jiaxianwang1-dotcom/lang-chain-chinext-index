@@ -112,9 +112,9 @@ let _defaultLlm: ChatOpenAI | null = null;
 function getDefaultLlm(): ChatOpenAI {
   if (_defaultLlm) return _defaultLlm;
   _defaultLlm = new ChatOpenAI({
-    model: "glm-4-flash",
-    apiKey: process.env.ZHIPU_API_KEY,
-    configuration: { baseURL: "https://open.bigmodel.cn/api/paas/v4" },
+    model: "moonshot-v1-32k",
+    apiKey: process.env.KIMI_API_KEY,
+    configuration: { baseURL: "https://api.moonshot.cn/v1" },
     temperature: 0.2,
   });
   return _defaultLlm;
@@ -142,7 +142,7 @@ const PREDICT_SYSTEM = `你是 A 股大盘趋势预测助手。
 2) confidence: 0~1 的小数，不要极端值（除非证据非常充分）。
 3) rationale: ≤ 150 字中文，引用最近 1-3 天关键事件或趋势变化。
 4) updated_memory: { summary, features }，与 bootstrap 同口径。
-5) 严格输出 JSON：{"direction":"up","confidence":0.6,"rationale":"...","updated_memory":{"summary":"...","features":{...}}}。
+5) 严格输出 JSON：{"direction":"up","confidence":0.xx,"rationale":"...","updated_memory":{"summary":"...","features":{...}}}。
 6) 不构成投资建议，但请基于数据给出结论，不要含糊。`;
 
 const PREDICT_DIRECT_SYSTEM = `你是 A 股大盘短线方向判断助手。
@@ -169,7 +169,7 @@ date / open / high / low / close / chg% / volume / reason
    (b) 量能变化（用表格中的 volume 字段，例如"5/8 量能 4.07亿手 较 5/7 的 3.21亿手 放大约 27%"）；
    (c) 至少一条来自 reason 列的真实事件，或一条来自 OHLC 的形态（如"5/9 高 4185 低 4150 收 4180，长下影"）。
    禁止泛泛之词如"震荡上行""市场情绪改善"。
-4) 严格输出 JSON：{"direction":"up","confidence":0.78,"rationale":"..."}。不要 Markdown，不要解释字段。`;
+4) 严格输出 JSON：{"direction":"up","confidence":0.xx,"rationale":"..."}。不要 Markdown，不要解释字段。`;
 
 export const PREDICT_MULTI_SIGNAL_SYSTEM = `你是 A 股大盘短线方向 + 涨跌幅判断助手（多信号模式 v2）。
 
@@ -226,13 +226,15 @@ H. **magnitude_bucket**: 按 |predicted_change_pct| 判档位：
 
 ============ 输出格式（严格 JSON，不要 Markdown）============
 
+⚠️ 严禁复制下面的示例数值！confidence / predicted_change_pct / low / high 必须根据上文真实数据独立计算，每次输出都应不同。
+
 {
   "direction": "up" | "down",
-  "confidence": 0.78,
-  "predicted_change_pct": 0.85,
-  "predicted_change_pct_low": 0.4,
-  "predicted_change_pct_high": 1.3,
-  "magnitude_bucket": "medium",
+  "confidence": 0.xx,
+  "predicted_change_pct": 0.yy,
+  "predicted_change_pct_low": 0.zz,
+  "predicted_change_pct_high": 0.ww,
+  "magnitude_bucket": "small" | "medium" | "large",
   "rationale": "≤280 字中文，必须引用 4+ 维度的具体数字/专名",
   "signals": {
     "trend":     "up"|"down"|"neutral"|"missing",
@@ -532,6 +534,15 @@ function inferBucket(absPct: number): MagnitudeBucket {
  *   4. magnitude_bucket 缺失或与 |pct| 不匹配则按 inferBucket 重算
  */
 export function normalizeMultiSignalPrediction(p: MultiSignalPrediction): MultiSignalPrediction {
+  // 检测 prompt 示例值污染：LLM 直接复制了示例中的 0.85
+  if (p.predicted_change_pct === 0.85 && p.confidence === 0.78) {
+    logStage({
+      stage: "predict.prompt_value_pollution_detected",
+      ok: false,
+      warning: "LLM 疑似复制了 prompt 示例值 (predicted_change_pct=0.85, confidence=0.78)",
+    });
+  }
+
   let pct = p.predicted_change_pct;
   if (pct == null || !Number.isFinite(pct)) {
     pct = p.direction === "up" ? 0.4 : -0.4;
@@ -867,6 +878,17 @@ export async function predictNextTradingDay(
     });
   }
 
+  // 调试：LLM 返回了内容但解析失败时，把原始输出记入日志
+  if (raw) {
+    logStage({
+      stage: "predict.llm_raw",
+      indexCode,
+      ok: true,
+      raw_length: raw.length,
+      raw_preview: raw.slice(0, 200),
+    });
+  }
+
   const lastDay = ctx.recent30[ctx.recent30.length - 1];
   const lastPct = lastDay.change_pct ?? 0;
   const fallback: MultiSignalPrediction = {
@@ -891,6 +913,14 @@ export async function predictNextTradingDay(
     },
   };
   const parsed = raw ? safeParseJson(raw, MultiSignalPredictionSchema, fallback) : fallback;
+  if (parsed === fallback && raw) {
+    logStage({
+      stage: "predict.parse_failed",
+      indexCode,
+      ok: false,
+      raw_preview: raw.slice(0, 300),
+    });
+  }
   const normalized = normalizeMultiSignalPrediction(parsed);
 
   const features: Record<string, unknown> = {
