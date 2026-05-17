@@ -272,6 +272,40 @@ export function getDb(): Database.Database {
       PRIMARY KEY (index_code, target_date)
     );
     CREATE INDEX IF NOT EXISTS idx_analysis_code_date ON prediction_analysis(index_code, target_date DESC);
+
+    -- ============ 体育彩票：开奖号码 ============
+    CREATE TABLE IF NOT EXISTS lottery_draws (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      lottery_type  TEXT    NOT NULL,        -- "daletou" | "shuangseqiu"
+      draw_date     TEXT    NOT NULL,        -- YYYY-MM-DD
+      draw_period   TEXT,                    -- 期号，如 "25056"
+      red_balls     TEXT    NOT NULL,        -- JSON 数组，红球/前区号码
+      blue_balls    TEXT    NOT NULL,        -- JSON 数组，蓝球/后区号码
+      extra_json    TEXT,                    -- 扩展字段 JSON
+      created_at    TEXT    NOT NULL,
+      updated_at    TEXT    NOT NULL,
+      UNIQUE(lottery_type, draw_date)
+    );
+    CREATE INDEX IF NOT EXISTS idx_lottery_type_date ON lottery_draws(lottery_type, draw_date DESC);
+
+    -- ============ 体育彩票：AI 预测记录 ============
+    CREATE TABLE IF NOT EXISTS lottery_predictions (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      lottery_type    TEXT    NOT NULL,      -- "daletou" | "shuangseqiu"
+      target_date     TEXT    NOT NULL,      -- 预测目标日期
+      prediction_no   INTEGER NOT NULL,      -- 第几组预测（1 或 2）
+      red_balls       TEXT    NOT NULL,      -- JSON 数组，预测红球/前区
+      blue_balls      TEXT    NOT NULL,      -- JSON 数组，预测蓝球/后区
+      confidence      REAL,                  -- 置信度 0~1
+      rationale       TEXT,                  -- 预测理由
+      model           TEXT,                  -- 模型标识
+      prompt_text     TEXT,                  -- 完整 prompt
+      predicted_at    TEXT    NOT NULL,
+      created_at      TEXT    NOT NULL,
+      updated_at      TEXT    NOT NULL,
+      UNIQUE(lottery_type, target_date, prediction_no)
+    );
+    CREATE INDEX IF NOT EXISTS idx_lottery_pred_type_date ON lottery_predictions(lottery_type, target_date DESC);
   `);
 
   // 给已经存在的 index_quotes 表补齐 OHLCV 列（向前迁移，幂等）
@@ -1444,6 +1478,146 @@ export function openDbForTest(path: string): Database.Database {
 /** 仅用于测试：替换全局 db 句柄。*/
 export function _setDbForTest(db: Database.Database | null): void {
   _db = db;
+}
+
+// ==================== 体育彩票 CRUD ====================
+
+export interface LotteryDrawRow {
+  id?: number;
+  lottery_type: "daletou" | "shuangseqiu";
+  draw_date: string;
+  draw_period?: string | null;
+  red_balls: string; // JSON array
+  blue_balls: string; // JSON array
+  extra_json?: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export function upsertLotteryDraw(row: LotteryDrawRow): void {
+  const db = getDb();
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO lottery_draws
+     (lottery_type, draw_date, draw_period, red_balls, blue_balls, extra_json, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(lottery_type, draw_date) DO UPDATE SET
+       draw_period = excluded.draw_period,
+       red_balls = excluded.red_balls,
+       blue_balls = excluded.blue_balls,
+       extra_json = COALESCE(excluded.extra_json, lottery_draws.extra_json),
+       updated_at = excluded.updated_at`
+  ).run(
+    row.lottery_type,
+    row.draw_date,
+    row.draw_period ?? null,
+    row.red_balls,
+    row.blue_balls,
+    row.extra_json ?? null,
+    now,
+    now
+  );
+}
+
+export function getLotteryDrawsInRange(
+  lotteryType: string,
+  startDate: string,
+  endDate: string
+): LotteryDrawRow[] {
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT * FROM lottery_draws
+       WHERE lottery_type = ? AND draw_date >= ? AND draw_date <= ?
+       ORDER BY draw_date ASC`
+    )
+    .all(lotteryType, startDate, endDate) as LotteryDrawRow[];
+}
+
+export function getLatestLotteryDraw(lotteryType: string): LotteryDrawRow | null {
+  const db = getDb();
+  const row = db
+    .prepare("SELECT * FROM lottery_draws WHERE lottery_type = ? ORDER BY draw_date DESC LIMIT 1")
+    .get(lotteryType) as LotteryDrawRow | undefined;
+  return row ?? null;
+}
+
+export interface LotteryPredictionRow {
+  id?: number;
+  lottery_type: "daletou" | "shuangseqiu";
+  target_date: string;
+  prediction_no: number;
+  red_balls: string; // JSON array
+  blue_balls: string; // JSON array
+  confidence: number | null;
+  rationale: string | null;
+  model: string | null;
+  prompt_text?: string | null;
+  predicted_at: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export function upsertLotteryPrediction(row: LotteryPredictionRow): void {
+  const db = getDb();
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO lottery_predictions
+     (lottery_type, target_date, prediction_no, red_balls, blue_balls,
+      confidence, rationale, model, prompt_text, predicted_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(lottery_type, target_date, prediction_no) DO UPDATE SET
+       red_balls = excluded.red_balls,
+       blue_balls = excluded.blue_balls,
+       confidence = excluded.confidence,
+       rationale = excluded.rationale,
+       model = excluded.model,
+       prompt_text = excluded.prompt_text,
+       predicted_at = excluded.predicted_at,
+       updated_at = excluded.updated_at`
+  ).run(
+    row.lottery_type,
+    row.target_date,
+    row.prediction_no,
+    row.red_balls,
+    row.blue_balls,
+    row.confidence ?? null,
+    row.rationale ?? null,
+    row.model ?? null,
+    row.prompt_text ?? null,
+    row.predicted_at,
+    now,
+    now
+  );
+}
+
+export function getLotteryPredictions(
+  lotteryType: string,
+  targetDate: string
+): LotteryPredictionRow[] {
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT * FROM lottery_predictions
+       WHERE lottery_type = ? AND target_date = ?
+       ORDER BY prediction_no ASC`
+    )
+    .all(lotteryType, targetDate) as LotteryPredictionRow[];
+}
+
+export function getLatestLotteryPrediction(
+  lotteryType: string
+): LotteryPredictionRow | null {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT * FROM lottery_predictions
+       WHERE lottery_type = ?
+       ORDER BY target_date DESC, prediction_no ASC
+       LIMIT 1`
+    )
+    .get(lotteryType) as LotteryPredictionRow | undefined;
+  return row ?? null;
 }
 
 export function closeDb(): void {

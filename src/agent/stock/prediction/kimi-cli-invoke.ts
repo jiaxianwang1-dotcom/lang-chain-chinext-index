@@ -1,4 +1,4 @@
-import { execSync } from "child_process";
+import { execSync, execFileSync } from "child_process";
 import { logStage } from "../utils/log.js";
 
 export interface KimiCliInvokeOptions {
@@ -26,6 +26,8 @@ function findKimiCli(): string {
  * 2. ~/.kimi/config.toml 已配置好 providers.kimi + models.kimi-for-coding
  *
  * 输出：从 kimi --quiet 的纯文本中提取 ```json...``` 代码块里的 JSON 字符串。
+ *
+ * 实现说明：使用 stdin 传入 prompt，避免命令行参数长度限制和 shell 转义问题。
  */
 export function createKimiCliInvoke(opts: KimiCliInvokeOptions = {}) {
   const cliPath = opts.cliPath ?? findKimiCli();
@@ -48,17 +50,18 @@ export function createKimiCliInvoke(opts: KimiCliInvokeOptions = {}) {
     const start = Date.now();
     let raw = "";
     const attempts = [
-      `${cliPath} --quiet --prompt ${JSON.stringify(fullPrompt)}`,
-      `${cliPath} --print --prompt ${JSON.stringify(fullPrompt)}`,
-      `${cliPath} --prompt ${JSON.stringify(fullPrompt)}`,
+      ["--quiet"],
+      ["--print"],
+      [],
     ];
     let lastError: Error | undefined;
-    for (const cmd of attempts) {
+    for (const args of attempts) {
       try {
         // 临时清空 KIMI_BASE_URL，防止项目 .env 覆盖 config.toml 中的 Coding API URL
         const env = { ...process.env };
         delete env.KIMI_BASE_URL;
-        raw = execSync(cmd, {
+        raw = execFileSync(cliPath, args, {
+          input: fullPrompt,
           encoding: "utf-8",
           timeout: timeoutMs,
           maxBuffer: 10 * 1024 * 1024, // 10MB

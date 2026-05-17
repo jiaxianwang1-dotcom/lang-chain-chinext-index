@@ -78,6 +78,13 @@ import {
 } from "./src/agent/stock/realtime/index.js";
 import { stockGraph, buildContextSystemMessage } from "./src/agent/stock/graph/index.js";
 import { logStage } from "./src/agent/stock/utils/log.js";
+import {
+  seedLotteryHistory,
+  getLotteryHistory,
+  computeLotteryStats,
+  type LotteryType,
+} from "./src/agent/lottery/provider.js";
+import { predictLotteryNumbers } from "./src/agent/lottery/prediction.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -1689,6 +1696,116 @@ app.post("/api/stock/chat", async (req, res) => {
   }
 });
 
+// ==================== 体育彩票 API ====================
+
+const VALID_LOTTERY_TYPES: LotteryType[] = ["daletou", "shuangseqiu"];
+
+function parseLotteryRangeQuery(req: express.Request, res: express.Response) {
+  const source = (req.method === "GET" ? req.query : req.body) as Record<string, unknown>;
+  const type = String(source.type ?? "");
+  if (!VALID_LOTTERY_TYPES.includes(type as LotteryType)) {
+    res.status(400).json({ error: "invalid lottery type, expected daletou or shuangseqiu" });
+    return null;
+  }
+  const rangeRaw = (source.range as string | undefined) ?? "1m";
+  if (!VALID_RANGES.includes(rangeRaw as RangeKey)) {
+    res.status(400).json({ error: "invalid range" });
+    return null;
+  }
+  const range = rangeRaw as RangeKey;
+  const from = source.from as string | undefined;
+  const to = source.to as string | undefined;
+  try {
+    const { start, end } = parseRange({ range, from, to });
+    return { type: type as LotteryType, range, from, to, start, end };
+  } catch (e) {
+    res.status(400).json({ error: e instanceof Error ? e.message : String(e) });
+    return null;
+  }
+}
+
+app.get("/api/lottery/draws", (req, res) => {
+  const parsed = parseLotteryRangeQuery(req, res);
+  if (!parsed) return;
+  try {
+    const rows = getLotteryHistory(parsed.type, parsed.start, parsed.end);
+    res.json({
+      type: parsed.type,
+      typeName: parsed.type === "daletou" ? "大乐透" : "双色球",
+      range: parsed.range,
+      from: parsed.start,
+      to: parsed.end,
+      count: rows.length,
+      rows: rows.map((r) => ({
+        drawDate: r.draw_date,
+        drawPeriod: r.draw_period,
+        redBalls: JSON.parse(r.red_balls),
+        blueBalls: JSON.parse(r.blue_balls),
+      })),
+    });
+  } catch (e) {
+    logStage({
+      stage: "lottery.draws_failed",
+      type: parsed.type,
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    res.status(500).json({ error: "lottery draws query failed" });
+  }
+});
+
+app.get("/api/lottery/predictions", async (req, res) => {
+  const parsed = parseLotteryRangeQuery(req, res);
+  if (!parsed) return;
+  const force = String(req.query.force ?? "") === "1";
+  try {
+    const result = await predictLotteryNumbers(parsed.type, parsed.start, parsed.end, { force });
+    res.json({
+      type: parsed.type,
+      typeName: parsed.type === "daletou" ? "大乐透" : "双色球",
+      targetDate: result.targetDate,
+      range: parsed.range,
+      from: parsed.start,
+      to: parsed.end,
+      predictions: result.predictions,
+      systemPrompt: result.systemPrompt,
+      userPrompt: result.userPrompt,
+      model: result.model,
+    });
+  } catch (e) {
+    logStage({
+      stage: "lottery.predictions_failed",
+      type: parsed.type,
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    res.status(502).json({ error: "lottery prediction failed", message: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+app.post("/api/lottery/predictions/refresh", async (req, res) => {
+  const parsed = parseLotteryRangeQuery(req, res);
+  if (!parsed) return;
+  try {
+    const result = await predictLotteryNumbers(parsed.type, parsed.start, parsed.end, { force: true });
+    res.json({
+      ok: true,
+      type: parsed.type,
+      typeName: parsed.type === "daletou" ? "大乐透" : "双色球",
+      targetDate: result.targetDate,
+      predictions: result.predictions,
+    });
+  } catch (e) {
+    logStage({
+      stage: "lottery.predictions_refresh_failed",
+      type: parsed.type,
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    res.status(502).json({ error: "lottery prediction refresh failed", message: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 // 测试钩子：把 Express app 暴露出去，避免在测试中 listen 端口。
 export { app as _appForTest };
 
@@ -1697,5 +1814,12 @@ if (process.env.WEB_AGENT_NO_LISTEN !== "1") {
   app.listen(PORT, () => {
     console.log(`\n  🤖 智能体已启动`);
     console.log(`  📡 访问 http://localhost:${PORT}\n`);
+    // 初始化彩票历史数据（幂等：已有数据则跳过）
+    try {
+      seedLotteryHistory({ days: 120 });
+      console.log("  🎱 彩票历史数据已初始化\n");
+    } catch (e) {
+      console.log("  ⚠️ 彩票数据初始化失败:", e instanceof Error ? e.message : String(e));
+    }
   });
 }
