@@ -115,7 +115,7 @@ async function kimiWebSearch(query: string): Promise<string> {
   // ---- Round 1: 请求 tool_calls ----
   let round1: {
     choices?: Array<{
-      message?: { content?: string; tool_calls?: KimiToolCall[] };
+      message?: { content?: string; reasoning_content?: string; tool_calls?: KimiToolCall[] };
       finish_reason?: string;
     }>;
   };
@@ -148,7 +148,8 @@ async function kimiWebSearch(query: string): Promise<string> {
     return "";
   }
 
-  const toolCalls = round1.choices?.[0]?.message?.tool_calls;
+  const round1Message = round1.choices?.[0]?.message;
+  const toolCalls = round1Message?.tool_calls;
   if (!toolCalls || toolCalls.length === 0) {
     // 没有触发 tool_calls，直接返回 content（可能模型直接回答了）
     const direct = round1.choices?.[0]?.message?.content ?? "";
@@ -159,6 +160,22 @@ async function kimiWebSearch(query: string): Promise<string> {
   // ---- Round 2: 把 tool_calls 结果传回 ----
   const toolCall = toolCalls[0];
   try {
+    const assistantMessage: Record<string, unknown> = {
+      role: "assistant",
+      content: round1Message?.content ?? "",
+      tool_calls: [
+        {
+          id: toolCall.id,
+          type: toolCall.type,
+          function: { name: toolCall.function.name, arguments: toolCall.function.arguments },
+        },
+      ],
+    };
+    // Kimi k2.6 启用 thinking 时，assistant message 必须携带 reasoning_content
+    const reasoningContent = round1Message?.reasoning_content;
+    if (reasoningContent) {
+      assistantMessage.reasoning_content = reasoningContent;
+    }
     const res2 = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
@@ -170,17 +187,7 @@ async function kimiWebSearch(query: string): Promise<string> {
         messages: [
           { role: "system", content: systemContent },
           { role: "user", content: query },
-          {
-            role: "assistant",
-            content: "",
-            tool_calls: [
-              {
-                id: toolCall.id,
-                type: toolCall.type,
-                function: { name: toolCall.function.name, arguments: toolCall.function.arguments },
-              },
-            ],
-          },
+          assistantMessage,
           { role: "tool", tool_call_id: toolCall.id, content: toolCall.function.arguments },
         ],
         tools,
