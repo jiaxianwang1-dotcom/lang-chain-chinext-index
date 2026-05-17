@@ -529,10 +529,10 @@ function formatNewsToday(asOfDate: string): string {
   const today = todayShanghai();
 
   // 1. [lastTradingDate, today] 范围内的新事件（覆盖上一交易日收盘后到当前的所有新闻）
-  const rangeEvents = getNewsInRange(asOfDate, today, 20);
+  const rangeEvents = getNewsInRange(asOfDate, today, 100);
 
   // 2. 仍在有效期内的历史大事件（impact_days > 1，跨天持续影响）
-  const activeEvents = getActiveNews(today, 20);
+  const activeEvents = getActiveNews(today, 100);
 
   // 3. 合并去重：按 title，保留最新 as_of_date 的版本
   const byTitle = new Map<string, ReturnType<typeof getTodayNewsEvents>[number]>();
@@ -543,17 +543,21 @@ function formatNewsToday(asOfDate: string): string {
     }
   }
 
-  // 4. 按 sentiment 绝对值降序，取前 15 条（避免 prompt 过长）
+  // 4. 按日期降序、sentiment 绝对值降序，取前 100 条
   const events = Array.from(byTitle.values())
-    .sort((a, b) => Math.abs(b.sentiment ?? 0) - Math.abs(a.sentiment ?? 0))
-    .slice(0, 15);
+    .sort((a, b) => {
+      if (a.as_of_date !== b.as_of_date) {
+        return b.as_of_date.localeCompare(a.as_of_date);
+      }
+      return Math.abs(b.sentiment ?? 0) - Math.abs(a.sentiment ?? 0);
+    })
+    .slice(0, 100);
 
   if (events.length === 0) return "<无相关新闻事件>";
   const lines: string[] = [];
   for (const e of events) {
     const s = e.sentiment != null ? (e.sentiment >= 0 ? "+" : "") + e.sentiment.toFixed(2) : "0";
-    const dayTag = e.as_of_date === today ? "" : ` (${e.as_of_date})`;
-    lines.push(`[${e.category} ${s} ${e.impact_indices ?? "-"}]${dayTag} ${e.title}`);
+    lines.push(`[${e.as_of_date} ${e.category} ${s} ${e.impact_indices ?? "-"}] ${e.title}`);
     if (e.rationale) lines.push(`  ↳ ${e.rationale}`);
   }
   return lines.join("\n");
