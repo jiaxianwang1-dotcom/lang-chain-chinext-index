@@ -1620,6 +1620,21 @@ export function getLatestLotteryPrediction(
   return row ?? null;
 }
 
+export function getLotteryPredictionsInRange(
+  lotteryType: string,
+  startDate: string,
+  endDate: string
+): LotteryPredictionRow[] {
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT * FROM lottery_predictions
+       WHERE lottery_type = ? AND target_date >= ? AND target_date <= ?
+       ORDER BY target_date ASC, prediction_no ASC`
+    )
+    .all(lotteryType, startDate, endDate) as LotteryPredictionRow[];
+}
+
 export function closeDb(): void {
   if (_db) {
     _db.close();

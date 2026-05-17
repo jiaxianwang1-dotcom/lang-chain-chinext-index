@@ -40,6 +40,7 @@ import {
   getExternalProxyInRange,
   getLatestFuturesBasis,
   getMacroEventsInRange,
+  getLotteryPredictionsInRange,
   type ExternalProxyRow,
   type MacroCalendarRow,
 } from "./src/agent/stock/db/index.js";
@@ -1729,6 +1730,51 @@ app.get("/api/lottery/draws", (req, res) => {
   if (!parsed) return;
   try {
     const rows = getLotteryHistory(parsed.type, parsed.start, parsed.end);
+
+    // 拉取同区间内 AI 预测，按 target_date 分组
+    const predictions = getLotteryPredictionsInRange(parsed.type, parsed.start, parsed.end);
+    const predByDate = new Map<string, typeof predictions>();
+    for (const p of predictions) {
+      const arr = predByDate.get(p.target_date) ?? [];
+      arr.push(p);
+      predByDate.set(p.target_date, arr);
+    }
+
+    // 为每条开奖记录匹配 target_date < draw_date 的最新预测（14 天内）
+    const rowsWithPred = rows.map((r) => {
+      const drawDate = r.draw_date;
+      let matched: typeof predictions | null = null;
+      for (let i = predictions.length - 1; i >= 0; i--) {
+        const p = predictions[i];
+        if (p.target_date < drawDate) {
+          // 限制 14 天内，避免匹配到太老的预测
+          const daysDiff =
+            (new Date(drawDate).getTime() - new Date(p.target_date).getTime()) /
+            (1000 * 60 * 60 * 24);
+          if (daysDiff <= 14) {
+            matched = predByDate.get(p.target_date) ?? null;
+          }
+          break;
+        }
+      }
+
+      return {
+        drawDate: r.draw_date,
+        drawPeriod: r.draw_period,
+        redBalls: JSON.parse(r.red_balls),
+        blueBalls: JSON.parse(r.blue_balls),
+        aiPredictions:
+          matched?.map((p) => ({
+            predictionNo: p.prediction_no,
+            redBalls: JSON.parse(p.red_balls) as number[],
+            blueBalls: JSON.parse(p.blue_balls) as number[],
+            confidence: p.confidence,
+            rationale: p.rationale,
+            targetDate: p.target_date,
+          })) ?? null,
+      };
+    });
+
     res.json({
       type: parsed.type,
       typeName: parsed.type === "daletou" ? "大乐透" : "双色球",
@@ -1736,12 +1782,7 @@ app.get("/api/lottery/draws", (req, res) => {
       from: parsed.start,
       to: parsed.end,
       count: rows.length,
-      rows: rows.map((r) => ({
-        drawDate: r.draw_date,
-        drawPeriod: r.draw_period,
-        redBalls: JSON.parse(r.red_balls),
-        blueBalls: JSON.parse(r.blue_balls),
-      })),
+      rows: rowsWithPred,
     });
   } catch (e) {
     logStage({
