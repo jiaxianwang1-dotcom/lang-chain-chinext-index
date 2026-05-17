@@ -99,6 +99,12 @@ interface KimiToolCall {
   function: { name: string; arguments: string };
 }
 
+function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")), timeoutMs);
+  return fetch(url, { ...init, signal: controller.signal }).finally(() => clearTimeout(id));
+}
+
 async function kimiWebSearch(query: string): Promise<string> {
   const apiKey = process.env.KIMI_API_KEY;
   if (!apiKey) return "";
@@ -116,7 +122,7 @@ async function kimiWebSearch(query: string): Promise<string> {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
       // ---- Round 1: 请求 tool_calls ----
-      const res1 = await fetch(`${baseUrl}/chat/completions`, {
+      const res1 = await fetchWithTimeout(`${baseUrl}/chat/completions`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${apiKey}`,
@@ -131,8 +137,7 @@ async function kimiWebSearch(query: string): Promise<string> {
           tools,
           temperature,
         }),
-        signal: AbortSignal.timeout(90000),
-      });
+      }, 90000);
       if (!res1.ok) {
         const body = await res1.text().catch(() => "<failed to read body>");
         logStage({ stage: "news.kimi_http_failed", ok: false, query, status: res1.status, body_preview: body.slice(0, 300), attempt: attempt + 1 });
@@ -170,7 +175,7 @@ async function kimiWebSearch(query: string): Promise<string> {
       // Kimi k2.6 启用 thinking 时，assistant message 必须携带 reasoning_content
       // 即使 Round 1 模型没返回，也要传空字符串占位，否则 Round 2 报 400
       assistantMessage.reasoning_content = round1Message?.reasoning_content ?? "";
-      const res2 = await fetch(`${baseUrl}/chat/completions`, {
+      const res2 = await fetchWithTimeout(`${baseUrl}/chat/completions`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${apiKey}`,
@@ -187,8 +192,7 @@ async function kimiWebSearch(query: string): Promise<string> {
           tools,
           temperature,
         }),
-        signal: AbortSignal.timeout(30000),
-      });
+      }, 30000);
       if (!res2.ok) {
         const body = await res2.text().catch(() => "<failed to read body>");
         logStage({ stage: "news.kimi_round2_http_failed", ok: false, query, status: res2.status, body_preview: body.slice(0, 300), attempt: attempt + 1 });
@@ -353,8 +357,7 @@ function extractHeadlines(searchText: string, source: string): RawHeadline[] {
 async function fetchSinaNews(limit = 15): Promise<RawHeadline[]> {
   const url = `https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516&k=&num=${limit}&page=1&r=${Date.now()}`;
   try {
-    const res = await fetch(url, {
-      signal: AbortSignal.timeout(15000),
+    const res = await fetchWithTimeout(url, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         Referer: "https://finance.sina.com.cn/",
@@ -370,7 +373,7 @@ async function fetchSinaNews(limit = 15): Promise<RawHeadline[]> {
         "Sec-Fetch-Site": "same-site",
         Connection: "keep-alive",
       },
-    });
+    }, 15000);
     if (!res.ok) {
       logStage({ stage: "news.sina_http_failed", ok: false, status: res.status });
       return [];
@@ -394,47 +397,52 @@ async function fetchSinaNews(limit = 15): Promise<RawHeadline[]> {
   }
 }
 
-/** 腾讯财经新闻作为 Sina 的备用源。 */
-async function fetchQQNews(limit = 15): Promise<RawHeadline[]> {
-  const url = `https://i.news.qq.com/trpc.qqnews_web.kv_srv.kv_srv_http_proxy/list?sub_srv_id=finance&srv_id=pc&offset=0&limit=${limit}`;
+/** 网易财经新闻作为 Sina 的备用源。 */
+async function fetch163News(limit = 15): Promise<RawHeadline[]> {
+  const url = "https://money.163.com/special/00251G8F/news_json.js";
   try {
-    const res = await fetch(url, {
-      signal: AbortSignal.timeout(15000),
+    const res = await fetchWithTimeout(url, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        Referer: "https://new.qq.com/",
-        Origin: "https://new.qq.com",
-        Accept: "application/json, text/plain, */*",
+        Referer: "https://money.163.com/",
+        Origin: "https://money.163.com",
+        Accept: "*/*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         "Accept-Encoding": "gzip, deflate, br",
-        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-site",
         Connection: "keep-alive",
       },
-    });
+    }, 15000);
     if (!res.ok) {
-      logStage({ stage: "news.qq_http_failed", ok: false, status: res.status });
+      logStage({ stage: "news.163_http_failed", ok: false, status: res.status });
       return [];
     }
-    const data = (await res.json()) as {
-      data?: { list?: Array<{ title?: string; url?: string; publish_time?: string }> };
-    };
-    const items = data.data?.list ?? [];
-    const out: RawHeadline[] = [];
-    for (const item of items) {
-      const title = item.title?.trim();
-      if (title && title.length >= 6 && title.length < 200) {
-        out.push({ title, url: item.url, source: "qq_finance" });
-      }
+    const text = await res.text();
+    // JSONP: var data={category:[...],news:[[{c,t,l,p},...]]}
+    const jsonStart = text.indexOf("{");
+    const jsonEnd = text.lastIndexOf("}");
+    if (jsonStart === -1 || jsonEnd === -1) {
+      logStage({ stage: "news.163_parse_failed", ok: false, reason: "no_json_bounds" });
+      return [];
     }
-    logStage({ stage: "news.qq_ok", ok: true, count: out.length });
+    const data = JSON.parse(text.slice(jsonStart, jsonEnd + 1)) as {
+      news?: Array<Array<{ t?: string; l?: string; p?: string }>>;
+    };
+    const groups = data.news ?? [];
+    const out: RawHeadline[] = [];
+    for (const group of groups) {
+      for (const item of group) {
+        const title = item.t?.trim();
+        if (title && title.length >= 6 && title.length < 200) {
+          out.push({ title, url: item.l, source: "163_finance" });
+        }
+        if (out.length >= limit) break;
+      }
+      if (out.length >= limit) break;
+    }
+    logStage({ stage: "news.163_ok", ok: true, count: out.length });
     return out;
   } catch (e) {
-    logStage({ stage: "news.qq_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
+    logStage({ stage: "news.163_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
     return [];
   }
 }
@@ -514,9 +522,9 @@ async function _classifyTodayNewsImpl(
   const search = opts.webSearch ?? defaultWebSearch;
   const queries = opts.queries ?? DEFAULT_QUERIES;
 
-  // 1) 并行抓多组关键词 + 新浪财经 + 腾讯财经兜底
+  // 1) 并行抓多组关键词 + 新浪财经 + 网易财经兜底
   const searchStart = Date.now();
-  const [searchResults, sinaHeadlines, qqHeadlines] = await Promise.all([
+  const [searchResults, sinaHeadlines, _163Headlines] = await Promise.all([
     Promise.all(
       queries.map(async (q) => {
         try {
@@ -538,8 +546,8 @@ async function _classifyTodayNewsImpl(
       logStage({ stage: "news.sina_fetch_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
       return [] as RawHeadline[];
     }),
-    fetchQQNews(15).catch((e) => {
-      logStage({ stage: "news.qq_fetch_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
+    fetch163News(15).catch((e) => {
+      logStage({ stage: "news.163_fetch_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
       return [] as RawHeadline[];
     }),
   ]);
@@ -551,8 +559,8 @@ async function _classifyTodayNewsImpl(
     }
   }
   headlines.push(...sinaHeadlines);
-  headlines.push(...qqHeadlines);
-  logStage({ stage: "news.sina_fetched", ok: true, count: sinaHeadlines.length, qq_count: qqHeadlines.length, elapsed_ms: Date.now() - searchStart });
+  headlines.push(..._163Headlines);
+  logStage({ stage: "news.sina_fetched", ok: true, count: sinaHeadlines.length, _163_count: _163Headlines.length, elapsed_ms: Date.now() - searchStart });
 
   // 去重（按 title）
   const dedup: RawHeadline[] = [];
