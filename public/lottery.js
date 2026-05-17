@@ -68,6 +68,7 @@
               <th>期号</th>
               <th>红球/前区</th>
               <th>蓝球/后区</th>
+              <th>AI 预测</th>
             </tr>
           </thead>
           <tbody data-role="tbody"></tbody>
@@ -108,12 +109,50 @@
     `;
   }
 
+  function renderPredictionCell(row) {
+    if (!row.aiPredictions || row.aiPredictions.length === 0) {
+      return `<td>-</td>`;
+    }
+    const actualRed = new Set(row.redBalls);
+    const actualBlue = new Set(row.blueBalls);
+
+    const html = row.aiPredictions.map((p) => {
+      const redHits = p.redBalls.filter((n) => actualRed.has(n)).length;
+      const blueHits = p.blueBalls.filter((n) => actualBlue.has(n)).length;
+      const redHtml = p.redBalls
+        .map((n) => {
+          const hit = actualRed.has(n) ? "hit" : "";
+          return `<span class="lottery-ball ${hit}">${n}</span>`;
+        })
+        .join("");
+      const blueHtml = p.blueBalls
+        .map((n) => {
+          const hit = actualBlue.has(n) ? "hit blue" : "blue";
+          return `<span class="lottery-ball ${hit}">${n}</span>`;
+        })
+        .join("");
+      return `
+        <div class="ai-pred-group">
+          <div class="ai-pred-meta">第${p.predictionNo}组 (${redHits}+${blueHits})</div>
+          <div class="lottery-balls">
+            ${redHtml}
+            <span class="lottery-ball plus">+</span>
+            ${blueHtml}
+          </div>
+        </div>
+      `;
+    }).join("");
+
+    return `<td>${html}</td>`;
+  }
+
   function renderRow(row) {
     return `
       <td>${escapeHtml(row.drawDate)}</td>
       <td>${escapeHtml(row.drawPeriod ?? "-")}</td>
       <td>${renderBalls(row.redBalls, [])}</td>
       <td>${renderBalls([], row.blueBalls)}</td>
+      ${renderPredictionCell(row)}
     `;
   }
 
