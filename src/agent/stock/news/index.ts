@@ -172,10 +172,8 @@ async function kimiWebSearch(query: string): Promise<string> {
       ],
     };
     // Kimi k2.6 启用 thinking 时，assistant message 必须携带 reasoning_content
-    const reasoningContent = round1Message?.reasoning_content;
-    if (reasoningContent) {
-      assistantMessage.reasoning_content = reasoningContent;
-    }
+    // 即使 Round 1 模型没返回，也要传空字符串占位，否则 Round 2 报 400
+    assistantMessage.reasoning_content = round1Message?.reasoning_content ?? ""
     const res2 = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
