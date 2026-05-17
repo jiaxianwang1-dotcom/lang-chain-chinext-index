@@ -135,7 +135,7 @@ async function kimiWebSearch(query: string): Promise<string> {
         tools,
         temperature,
       }),
-      signal: AbortSignal.timeout(20000),
+      signal: AbortSignal.timeout(45000),
     });
     if (!res1.ok) {
       const body = await res1.text().catch(() => "<failed to read body>");
