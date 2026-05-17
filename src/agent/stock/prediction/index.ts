@@ -209,6 +209,7 @@ export function buildMultiSignalSystemPrompt(indexName = "大盘"): string {
 ============ 硬性纪律（违反则视为不合格输出）============
 
 A. **禁止编造**：你只能引用上述 10 维数据中**实际出现的数字与文本**。如果某维度被标注 "<数据缺失>"，rationale 中 MUST NOT 编造该维度的数字。
+A2. **禁止张冠李戴**：引用 30 日明细中的具体日期与数值时，必须严格一一对应。不得把其他交易日的 close/change_pct/volume 数据套用到错误日期上。若记不清某日的具体数字，宁可不引用该日，也不准猜测或挪用。
 B. **direction 必须二选一**：不允许中立 / 震荡 / 看不清。
 C. **维度覆盖**：rationale ≤ 280 字，**至少引用 4 个不同维度**的具体证据，且每条证据必须包含具体数字或专有名词（例：板块名 / 股票名 / 事件标题片段）。
 D. **维度冲突时降低置信度**：当多个维度方向相反（例如价格上涨但融资资金净流出 + 当日新闻偏负面）时，confidence MUST 在 [0.55, 0.65]，且 rationale 必须明确指出"维度冲突"或"分歧"。
@@ -330,6 +331,20 @@ function formatQuotesAsTable(rows: IndexQuoteRow[], limit = 80): string {
     })
     .join("\n");
   return `${header}\n${body}`;
+}
+
+/** 最近 N 日关键数据校验摘要，供 LLM rationale 引用时核对，防止张冠李戴。 */
+function formatRecentKeyDays(rows: IndexQuoteRow[], days = 5): string {
+  const tail = rows.slice(-days);
+  if (tail.length === 0) return "";
+  const lines = [`【最近 ${tail.length} 日关键数据（rationale 引用时请严格核对）】`];
+  for (const r of tail) {
+    const pct = r.change_pct == null ? "-" : (r.change_pct >= 0 ? "+" : "") + r.change_pct.toFixed(2) + "%";
+    lines.push(
+      `  ${r.trade_date}: 开=${fmtNum(r.open_value)} 高=${fmtNum(r.high_value)} 低=${fmtNum(r.low_value)} 收=${fmtNum(r.close_value)} 涨跌=${pct} 量=${fmtVolume(r.volume)}`
+    );
+  }
+  return lines.join("\n");
 }
 
 // ==================== Bootstrap ====================
@@ -827,6 +842,8 @@ export function buildMultiSignalUserPrompt(ctx: MultiSignalContext): string {
 
   sections.push(`========== 维度 1：价格趋势（30 日明细 + 长窗摘要）==========`);
   sections.push(formatQuotesAsTable(ctx.recent30, ctx.windowDays));
+  sections.push("");
+  sections.push(formatRecentKeyDays(ctx.recent30, 5));
   sections.push("");
   sections.push(formatLongWindowSummary(win60, "近 60 日"));
   sections.push(formatLongWindowSummary(win90, "近 90 日"));
