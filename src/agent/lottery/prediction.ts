@@ -3,6 +3,7 @@ import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import {
   getLotteryDrawsInRange,
+  getLotteryPredictions,
   upsertLotteryPrediction,
   type LotteryPredictionRow,
 } from "../stock/db/index.js";
@@ -213,9 +214,22 @@ export async function predictLotteryNumbers(
 
   // 若未强制刷新，先查缓存
   if (!opts.force) {
-    const existing = getLotteryDrawsInRange(type, targetDate, targetDate); // 这里查的是预测表，不是开奖表
-    // 简单判断：如果今天已有预测则不重复生成（实际应该用 prediction 表查）
-    // 由于 prediction 表的数据不会太多，直接生成即可
+    const cached = getLotteryPredictions(type, targetDate);
+    if (cached.length >= 2) {
+      return {
+        targetDate,
+        predictions: cached.map((c) => ({
+          predictionNo: c.prediction_no,
+          redBalls: JSON.parse(c.red_balls) as number[],
+          blueBalls: JSON.parse(c.blue_balls) as number[],
+          confidence: c.confidence,
+          rationale: c.rationale,
+        })),
+        systemPrompt: "",
+        userPrompt: cached[0]?.prompt_text ?? "",
+        model: cached[0]?.model ?? getModelName(),
+      };
+    }
   }
 
   const systemPrompt = buildLotterySystemPrompt(type);
