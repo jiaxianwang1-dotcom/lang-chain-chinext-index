@@ -110,9 +110,9 @@ async function kimiWebSearch(query: string): Promise<string> {
   if (!apiKey) return "";
 
   const baseUrl = process.env.KIMI_BASE_URL ?? "https://api.moonshot.cn/v1";
-  const searchModel = process.env.KIMI_SEARCH_MODEL ?? "moonshot-v1-8k";
-  const followUpModel = process.env.KIMI_SEARCH_FOLLOWUP_MODEL ?? process.env.KIMI_MODEL ?? "kimi-k2.6";
-  const temperature = followUpModel.includes("k2.6") ? 1 : 0.1;
+  const searchModel = process.env.KIMI_SEARCH_MODEL ?? "kimi-k2.5";
+  const followUpModel = process.env.KIMI_SEARCH_FOLLOWUP_MODEL ?? searchModel;
+  const temperature = /k2\.[56]/.test(followUpModel) ? 1 : 0.1;
   const MAX_RETRIES = 2;
 
   const systemContent =
@@ -137,7 +137,7 @@ async function kimiWebSearch(query: string): Promise<string> {
           tools,
           temperature,
         }),
-      }, 90000);
+      }, 300000);
       if (!res1.ok) {
         const body = await res1.text().catch(() => "<failed to read body>");
         logStage({ stage: "news.kimi_http_failed", ok: false, query, status: res1.status, body_preview: body.slice(0, 300), attempt: attempt + 1 });
@@ -192,7 +192,7 @@ async function kimiWebSearch(query: string): Promise<string> {
           tools,
           temperature,
         }),
-      }, 30000);
+      }, 300000);
       if (!res2.ok) {
         const body = await res2.text().catch(() => "<failed to read body>");
         logStage({ stage: "news.kimi_round2_http_failed", ok: false, query, status: res2.status, body_preview: body.slice(0, 300), attempt: attempt + 1 });
@@ -359,21 +359,12 @@ async function fetchSinaNews(limit = 15): Promise<RawHeadline[]> {
   try {
     const res = await fetchWithTimeout(url, {
       headers: {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         Referer: "https://finance.sina.com.cn/",
-        Origin: "https://finance.sina.com.cn",
         Accept: "application/json, text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"macOS"',
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-site",
-        Connection: "keep-alive",
       },
-    }, 15000);
+    }, 300000);
     if (!res.ok) {
       logStage({ stage: "news.sina_http_failed", ok: false, status: res.status });
       return [];
@@ -411,7 +402,7 @@ async function fetch163News(limit = 15): Promise<RawHeadline[]> {
         "Accept-Encoding": "gzip, deflate, br",
         Connection: "keep-alive",
       },
-    }, 15000);
+    }, 300000);
     if (!res.ok) {
       logStage({ stage: "news.163_http_failed", ok: false, status: res.status });
       return [];
@@ -420,13 +411,23 @@ async function fetch163News(limit = 15): Promise<RawHeadline[]> {
     // JSONP: var data={category:[...],news:[[{c,t,l,p},...]]}
     const jsonStart = text.indexOf("{");
     const jsonEnd = text.lastIndexOf("}");
-    if (jsonStart === -1 || jsonEnd === -1) {
-      logStage({ stage: "news.163_parse_failed", ok: false, reason: "no_json_bounds" });
+    if (jsonStart === -1 || jsonEnd === -1 || jsonEnd <= jsonStart) {
+      logStage({ stage: "news.163_parse_failed", ok: false, reason: "no_json_bounds", preview: text.slice(0, 200) });
       return [];
     }
-    const data = JSON.parse(text.slice(jsonStart, jsonEnd + 1)) as {
-      news?: Array<Array<{ t?: string; l?: string; p?: string }>>;
-    };
+    const jsonSlice = text.slice(jsonStart, jsonEnd + 1).trim();
+    if (!jsonSlice.startsWith("{")) {
+      logStage({ stage: "news.163_parse_failed", ok: false, reason: "not_json", preview: jsonSlice.slice(0, 200) });
+      return [];
+    }
+    // 网易返回的是 JavaScript 对象字面量（裸属性名），不是标准 JSON
+    let data: { news?: Array<Array<{ t?: string; l?: string; p?: string }>> };
+    try {
+      data = new Function("return " + jsonSlice)() as typeof data;
+    } catch (parseErr) {
+      logStage({ stage: "news.163_parse_failed", ok: false, reason: "js_parse_error", preview: jsonSlice.slice(0, 200) });
+      return [];
+    }
     const groups = data.news ?? [];
     const out: RawHeadline[] = [];
     for (const group of groups) {
@@ -445,6 +446,52 @@ async function fetch163News(limit = 15): Promise<RawHeadline[]> {
     logStage({ stage: "news.163_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
     return [];
   }
+}
+
+/** 腾讯新闻热榜作为备用源（偏社会热点，但可补充政策/国际类）。 */
+async function fetchQQNews(limit = 15): Promise<RawHeadline[]> {
+  const url = "https://r.inews.qq.com/gw/event/hot_ranking_list?offset=0&page_size=20";
+  try {
+    const res = await fetchWithTimeout(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+        Accept: "application/json",
+      },
+    }, 300000);
+    if (!res.ok) {
+      logStage({ stage: "news.qq_http_failed", ok: false, status: res.status });
+      return [];
+    }
+    const data = (await res.json()) as {
+      idlist?: Array<{ newslist?: Array<{ title?: string; url?: string }> }>;
+      newslist?: Array<{ title?: string; url?: string }>;
+    };
+    const items = data.newslist ?? data.idlist?.[0]?.newslist ?? [];
+    const out: RawHeadline[] = [];
+    for (const item of items) {
+      const title = item.title?.trim();
+      if (title && title.length >= 6 && title.length < 200) {
+        out.push({ title, url: item.url, source: "qq_news" });
+      }
+      if (out.length >= limit) break;
+    }
+    logStage({ stage: "news.qq_ok", ok: true, count: out.length });
+    return out;
+  } catch (e) {
+    logStage({ stage: "news.qq_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
+    return [];
+  }
+}
+
+/** 限制并发数执行异步任务。 */
+async function runWithConcurrencyLimit<T>(tasks: (() => Promise<T>)[], limit: number): Promise<T[]> {
+  const results: T[] = [];
+  for (let i = 0; i < tasks.length; i += limit) {
+    const batch = tasks.slice(i, i + limit);
+    const batchResults = await Promise.all(batch.map((t) => t()));
+    results.push(...batchResults);
+  }
+  return results;
 }
 
 // ==================== 主流程 ====================
@@ -522,26 +569,26 @@ async function _classifyTodayNewsImpl(
   const search = opts.webSearch ?? defaultWebSearch;
   const queries = opts.queries ?? DEFAULT_QUERIES;
 
-  // 1) 并行抓多组关键词 + 新浪财经 + 网易财经兜底
+  // 1) 分批抓关键词（限制并发=2，避免 API 超时连锁反应）+ 多源兜底
   const searchStart = Date.now();
-  const [searchResults, sinaHeadlines, _163Headlines] = await Promise.all([
-    Promise.all(
-      queries.map(async (q) => {
-        try {
-          const txt = await search(q);
-          return { ok: true as const, query: q, txt };
-        } catch (e) {
-          result.search_failed_count += 1;
-          logStage({
-            stage: "news.search_failed",
-            ok: false,
-            query: q,
-            error: e instanceof Error ? e.message : String(e),
-          });
-          return { ok: false as const, query: q, txt: "" };
-        }
-      })
-    ),
+  const searchTasks = queries.map((q) => async () => {
+    try {
+      const txt = await search(q);
+      return { ok: true as const, query: q, txt };
+    } catch (e) {
+      result.search_failed_count += 1;
+      logStage({
+        stage: "news.search_failed",
+        ok: false,
+        query: q,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return { ok: false as const, query: q, txt: "" };
+    }
+  });
+
+  const [searchResults, sinaHeadlines, _163Headlines, qqHeadlines] = await Promise.all([
+    runWithConcurrencyLimit(searchTasks, 2),
     fetchSinaNews(15).catch((e) => {
       logStage({ stage: "news.sina_fetch_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
       return [] as RawHeadline[];
@@ -550,17 +597,22 @@ async function _classifyTodayNewsImpl(
       logStage({ stage: "news.163_fetch_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
       return [] as RawHeadline[];
     }),
+    fetchQQNews(15).catch((e) => {
+      logStage({ stage: "news.qq_fetch_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
+      return [] as RawHeadline[];
+    }),
   ]);
 
   const headlines: RawHeadline[] = [];
   for (const r of searchResults) {
     if (r.ok) {
-      headlines.push(...extractHeadlines(r.txt, `web_search:ddg:${r.query}`));
+      headlines.push(...extractHeadlines(r.txt, `web_search:kimi:${r.query}`));
     }
   }
   headlines.push(...sinaHeadlines);
   headlines.push(..._163Headlines);
-  logStage({ stage: "news.sina_fetched", ok: true, count: sinaHeadlines.length, _163_count: _163Headlines.length, elapsed_ms: Date.now() - searchStart });
+  headlines.push(...qqHeadlines);
+  logStage({ stage: "news.fetched", ok: true, sina: sinaHeadlines.length, _163: _163Headlines.length, qq: qqHeadlines.length, elapsed_ms: Date.now() - searchStart });
 
   // 去重（按 title）
   const dedup: RawHeadline[] = [];
