@@ -13,7 +13,7 @@
   if (!root) return;
 
   // ---------- DOM 骨架 ----------
-  const selector = createRangeSelector("1m");
+  const selector = createRangeSelector("1y");
   root.appendChild(selector.root);
 
   // 免责声明
