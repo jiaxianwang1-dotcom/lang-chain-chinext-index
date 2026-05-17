@@ -59,7 +59,11 @@ function getDrawDayDates(daysOfWeek: number[], endDate: string, count: number): 
 }
 
 export function seedLotteryHistory(opts?: { days?: number; endDate?: string }): void {
-  const endDate = opts?.endDate ?? todayShanghai();
+  const today = todayShanghai();
+  // 模拟数据只生成到昨天，避免把今天或未来的开奖日也塞上假号码
+  const yesterday = new Date(`${today}T00:00:00Z`);
+  yesterday.setUTCDate(yesterday.getUTCDate() - 1);
+  const endDate = opts?.endDate ?? yesterday.toISOString().slice(0, 10);
   const days = opts?.days ?? 90;
 
   for (const [type, cfg] of Object.entries(LOTTERY_CONFIG)) {

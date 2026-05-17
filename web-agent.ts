@@ -1729,9 +1729,9 @@ app.get("/api/lottery/draws", (req, res) => {
   const parsed = parseLotteryRangeQuery(req, res);
   if (!parsed) return;
   try {
-    const rows = getLotteryHistory(parsed.type, parsed.start, parsed.end);
-
-    // 拉取同区间内 AI 预测，按 target_date 分组
+    const rows = getLotteryHistory(parsed.type, parsed.start, parsed.end)
+      // 过滤掉今天及未来的假数据（开奖都是晚上，白天不应展示当天“结果”）
+      .filter((r) => r.draw_date < todayShanghai());
     const predictions = getLotteryPredictionsInRange(parsed.type, parsed.start, parsed.end);
     const predByDate = new Map<string, typeof predictions>();
     for (const p of predictions) {
