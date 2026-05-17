@@ -107,115 +107,122 @@ async function kimiWebSearch(query: string): Promise<string> {
   const searchModel = process.env.KIMI_SEARCH_MODEL ?? "moonshot-v1-8k";
   const followUpModel = process.env.KIMI_SEARCH_FOLLOWUP_MODEL ?? process.env.KIMI_MODEL ?? "kimi-k2.6";
   const temperature = followUpModel.includes("k2.6") ? 1 : 0.1;
+  const MAX_RETRIES = 2;
 
   const systemContent =
     "你是一个搜索助手。请使用 web_search 工具搜索用户的问题，然后以纯文本列表形式返回搜索结果。每条结果一行，格式：标题 - 摘要（URL）。只输出结果列表，不要额外解释。";
   const tools = [{ type: "builtin_function", function: { name: "$web_search" } }];
 
-  // ---- Round 1: 请求 tool_calls ----
-  let round1: {
-    choices?: Array<{
-      message?: { content?: string; reasoning_content?: string; tool_calls?: KimiToolCall[] };
-      finish_reason?: string;
-    }>;
-  };
-  try {
-    const res1 = await fetch(`${baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: searchModel,
-        messages: [
-          { role: "system", content: systemContent },
-          { role: "user", content: query },
-        ],
-        tools,
-        temperature,
-      }),
-      signal: AbortSignal.timeout(45000),
-    });
-    if (!res1.ok) {
-      const body = await res1.text().catch(() => "<failed to read body>");
-      logStage({ stage: "news.kimi_http_failed", ok: false, query, status: res1.status, body_preview: body.slice(0, 300) });
-      return "";
-    }
-    round1 = (await res1.json()) as typeof round1;
-  } catch (e) {
-    logStage({ stage: "news.kimi_search_failed", ok: false, query, error: e instanceof Error ? e.message : String(e) });
-    return "";
-  }
-
-  const round1Message = round1.choices?.[0]?.message;
-  const toolCalls = round1Message?.tool_calls;
-  if (!toolCalls || toolCalls.length === 0) {
-    // 没有触发 tool_calls，直接返回 content（可能模型直接回答了）
-    const direct = round1.choices?.[0]?.message?.content ?? "";
-    logStage({ stage: "news.kimi_no_tool_calls", ok: true, query, content_length: direct.length });
-    return direct;
-  }
-
-  // ---- Round 2: 把 tool_calls 结果传回 ----
-  const toolCall = toolCalls[0];
-  try {
-    const assistantMessage: Record<string, unknown> = {
-      role: "assistant",
-      content: round1Message?.content ?? "",
-      tool_calls: [
-        {
-          id: toolCall.id,
-          type: toolCall.type,
-          function: { name: toolCall.function.name, arguments: toolCall.function.arguments },
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      // ---- Round 1: 请求 tool_calls ----
+      const res1 = await fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
         },
-      ],
-    };
-    // Kimi k2.6 启用 thinking 时，assistant message 必须携带 reasoning_content
-    // 即使 Round 1 模型没返回，也要传空字符串占位，否则 Round 2 报 400
-    assistantMessage.reasoning_content = round1Message?.reasoning_content ?? ""
-    const res2 = await fetch(`${baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: followUpModel,
-        messages: [
-          { role: "system", content: systemContent },
-          { role: "user", content: query },
-          assistantMessage,
-          { role: "tool", tool_call_id: toolCall.id, content: toolCall.function.arguments },
+        body: JSON.stringify({
+          model: searchModel,
+          messages: [
+            { role: "system", content: systemContent },
+            { role: "user", content: query },
+          ],
+          tools,
+          temperature,
+        }),
+        signal: AbortSignal.timeout(90000),
+      });
+      if (!res1.ok) {
+        const body = await res1.text().catch(() => "<failed to read body>");
+        logStage({ stage: "news.kimi_http_failed", ok: false, query, status: res1.status, body_preview: body.slice(0, 300), attempt: attempt + 1 });
+        return "";
+      }
+      const round1 = (await res1.json()) as {
+        choices?: Array<{
+          message?: { content?: string; reasoning_content?: string; tool_calls?: KimiToolCall[] };
+          finish_reason?: string;
+        }>;
+      };
+
+      const round1Message = round1.choices?.[0]?.message;
+      const toolCalls = round1Message?.tool_calls;
+      if (!toolCalls || toolCalls.length === 0) {
+        // 没有触发 tool_calls，直接返回 content（可能模型直接回答了）
+        const direct = round1.choices?.[0]?.message?.content ?? "";
+        logStage({ stage: "news.kimi_no_tool_calls", ok: true, query, content_length: direct.length, attempt: attempt + 1 });
+        return direct;
+      }
+
+      // ---- Round 2: 把 tool_calls 结果传回 ----
+      const toolCall = toolCalls[0];
+      const assistantMessage: Record<string, unknown> = {
+        role: "assistant",
+        content: round1Message?.content ?? "",
+        tool_calls: [
+          {
+            id: toolCall.id,
+            type: toolCall.type,
+            function: { name: toolCall.function.name, arguments: toolCall.function.arguments },
+          },
         ],
-        tools,
-        temperature,
-      }),
-      signal: AbortSignal.timeout(20000),
-    });
-    if (!res2.ok) {
-      const body = await res2.text().catch(() => "<failed to read body>");
-      logStage({ stage: "news.kimi_round2_http_failed", ok: false, query, status: res2.status, body_preview: body.slice(0, 300) });
+      };
+      // Kimi k2.6 启用 thinking 时，assistant message 必须携带 reasoning_content
+      // 即使 Round 1 模型没返回，也要传空字符串占位，否则 Round 2 报 400
+      assistantMessage.reasoning_content = round1Message?.reasoning_content ?? "";
+      const res2 = await fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: followUpModel,
+          messages: [
+            { role: "system", content: systemContent },
+            { role: "user", content: query },
+            assistantMessage,
+            { role: "tool", tool_call_id: toolCall.id, content: toolCall.function.arguments },
+          ],
+          tools,
+          temperature,
+        }),
+        signal: AbortSignal.timeout(30000),
+      });
+      if (!res2.ok) {
+        const body = await res2.text().catch(() => "<failed to read body>");
+        logStage({ stage: "news.kimi_round2_http_failed", ok: false, query, status: res2.status, body_preview: body.slice(0, 300), attempt: attempt + 1 });
+        return "";
+      }
+      const round2 = (await res2.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      const content = round2.choices?.[0]?.message?.content ?? "";
+      logStage({ stage: "news.kimi_raw", ok: true, query, raw_length: content.length, raw_preview: content.slice(0, 300), attempt: attempt + 1 });
+      // 尽量适配 extractHeadlines 的解析逻辑：把行包装成 【摘要】xxx 格式
+      const lines = content
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l.length > 6 && !l.startsWith("#"))
+        .map((l) => l.replace(/^[-•*]\s+/, "")); // 去掉列表标记
+      const out = lines.map((l) => `【摘要】${l}`).join("\n");
+      logStage({ stage: "news.kimi_parsed", ok: true, query, lines: lines.length, attempt: attempt + 1 });
+      return out;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const isTimeout = msg.includes("timeout") || msg.includes("aborted") || msg.includes("The operation was aborted");
+      if (isTimeout && attempt < MAX_RETRIES - 1) {
+        const delayMs = 2000 * (attempt + 1);
+        logStage({ stage: "news.kimi_search_retry", ok: true, query, attempt: attempt + 1, delay_ms: delayMs, error: msg });
+        await new Promise((r) => setTimeout(r, delayMs));
+        continue;
+      }
+      logStage({ stage: "news.kimi_search_failed", ok: false, query, error: msg, attempt: attempt + 1 });
       return "";
     }
-    const round2 = (await res2.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-    const content = round2.choices?.[0]?.message?.content ?? "";
-    logStage({ stage: "news.kimi_raw", ok: true, query, raw_length: content.length, raw_preview: content.slice(0, 300) });
-    // 尽量适配 extractHeadlines 的解析逻辑：把行包装成 【摘要】xxx 格式
-    const lines = content
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l.length > 6 && !l.startsWith("#"))
-      .map((l) => l.replace(/^[-•*]\s+/, "")); // 去掉列表标记
-    const out = lines.map((l) => `【摘要】${l}`).join("\n");
-    logStage({ stage: "news.kimi_parsed", ok: true, query, lines: lines.length });
-    return out;
-  } catch (e) {
-    logStage({ stage: "news.kimi_search_failed", ok: false, query, error: e instanceof Error ? e.message : String(e) });
-    return "";
   }
+
+  return "";
 }
 
 async function defaultWebSearch(query: string): Promise<string> {
@@ -347,13 +354,20 @@ async function fetchSinaNews(limit = 15): Promise<RawHeadline[]> {
   const url = `https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516&k=&num=${limit}&page=1&r=${Date.now()}`;
   try {
     const res = await fetch(url, {
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(15000),
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         Referer: "https://finance.sina.com.cn/",
+        Origin: "https://finance.sina.com.cn",
         Accept: "application/json, text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         "Accept-Encoding": "gzip, deflate, br",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"macOS"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
         Connection: "keep-alive",
       },
     });
@@ -376,6 +390,51 @@ async function fetchSinaNews(limit = 15): Promise<RawHeadline[]> {
     return out;
   } catch (e) {
     logStage({ stage: "news.sina_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
+    return [];
+  }
+}
+
+/** 腾讯财经新闻作为 Sina 的备用源。 */
+async function fetchQQNews(limit = 15): Promise<RawHeadline[]> {
+  const url = `https://i.news.qq.com/trpc.qqnews_web.kv_srv.kv_srv_http_proxy/list?sub_srv_id=finance&srv_id=pc&offset=0&limit=${limit}`;
+  try {
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(15000),
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        Referer: "https://new.qq.com/",
+        Origin: "https://new.qq.com",
+        Accept: "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
+        Connection: "keep-alive",
+      },
+    });
+    if (!res.ok) {
+      logStage({ stage: "news.qq_http_failed", ok: false, status: res.status });
+      return [];
+    }
+    const data = (await res.json()) as {
+      data?: { list?: Array<{ title?: string; url?: string; publish_time?: string }> };
+    };
+    const items = data.data?.list ?? [];
+    const out: RawHeadline[] = [];
+    for (const item of items) {
+      const title = item.title?.trim();
+      if (title && title.length >= 6 && title.length < 200) {
+        out.push({ title, url: item.url, source: "qq_finance" });
+      }
+    }
+    logStage({ stage: "news.qq_ok", ok: true, count: out.length });
+    return out;
+  } catch (e) {
+    logStage({ stage: "news.qq_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
     return [];
   }
 }
@@ -455,9 +514,9 @@ async function _classifyTodayNewsImpl(
   const search = opts.webSearch ?? defaultWebSearch;
   const queries = opts.queries ?? DEFAULT_QUERIES;
 
-  // 1) 并行抓多组关键词 + 新浪财经兜底
+  // 1) 并行抓多组关键词 + 新浪财经 + 腾讯财经兜底
   const searchStart = Date.now();
-  const [searchResults, sinaHeadlines] = await Promise.all([
+  const [searchResults, sinaHeadlines, qqHeadlines] = await Promise.all([
     Promise.all(
       queries.map(async (q) => {
         try {
@@ -479,6 +538,10 @@ async function _classifyTodayNewsImpl(
       logStage({ stage: "news.sina_fetch_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
       return [] as RawHeadline[];
     }),
+    fetchQQNews(15).catch((e) => {
+      logStage({ stage: "news.qq_fetch_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
+      return [] as RawHeadline[];
+    }),
   ]);
 
   const headlines: RawHeadline[] = [];
@@ -488,7 +551,8 @@ async function _classifyTodayNewsImpl(
     }
   }
   headlines.push(...sinaHeadlines);
-  logStage({ stage: "news.sina_fetched", ok: true, count: sinaHeadlines.length, elapsed_ms: Date.now() - searchStart });
+  headlines.push(...qqHeadlines);
+  logStage({ stage: "news.sina_fetched", ok: true, count: sinaHeadlines.length, qq_count: qqHeadlines.length, elapsed_ms: Date.now() - searchStart });
 
   // 去重（按 title）
   const dedup: RawHeadline[] = [];
