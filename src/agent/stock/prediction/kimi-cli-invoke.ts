@@ -48,9 +48,10 @@ export function createKimiCliInvoke(opts: KimiCliInvokeOptions = {}) {
     const start = Date.now();
     let raw = "";
     try {
-      // 临时清空 KIMI_BASE_URL，防止项目 .env 覆盖 config.toml 中的 Coding API URL
+      // 临时清空 .env 里的 KIMI_API_KEY / KIMI_BASE_URL，防止覆盖 config.toml 中的 Coding API 配置
       const env = { ...process.env };
       delete env.KIMI_BASE_URL;
+      delete env.KIMI_API_KEY;
       raw = execSync(
         `${cliPath} --quiet --prompt ${JSON.stringify(fullPrompt)}`,
         {
