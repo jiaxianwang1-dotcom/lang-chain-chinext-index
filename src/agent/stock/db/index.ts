@@ -859,14 +859,14 @@ export function getRecentNews(limit = 30): NewsEventRow[] {
     .all(limit) as NewsEventRow[];
 }
 
-/** 查询 [start, end] 日期范围内的新闻（按 sentiment 强度排序）。 */
+/** 查询 [start, end] 日期范围内的新闻（按日期降序，同一天内按 sentiment 强度排序）。 */
 export function getNewsInRange(start: string, end: string, limit = 20): NewsEventRow[] {
   const db = getDb();
   return db
     .prepare(
       `SELECT * FROM news_event
        WHERE as_of_date >= ? AND as_of_date <= ?
-       ORDER BY ABS(COALESCE(sentiment, 0)) DESC, as_of_date DESC, id ASC
+       ORDER BY as_of_date DESC, ABS(COALESCE(sentiment, 0)) DESC, id ASC
        LIMIT ?`
     )
     .all(start, end, limit) as NewsEventRow[];
@@ -884,7 +884,7 @@ export function getActiveNews(queryDate: string, limit = 20): NewsEventRow[] {
       `SELECT * FROM news_event
        WHERE as_of_date <= ?
          AND date(as_of_date, '+' || COALESCE(impact_days, 1) || ' days') >= ?
-       ORDER BY ABS(COALESCE(sentiment, 0)) DESC, as_of_date DESC, id ASC
+       ORDER BY as_of_date DESC, ABS(COALESCE(sentiment, 0)) DESC, id ASC
        LIMIT ?`
     )
     .all(queryDate, queryDate, limit) as NewsEventRow[];
