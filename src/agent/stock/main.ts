@@ -4,7 +4,7 @@ import { getDb } from "./db/index.js";
 import { backfillOneYear, refreshOhlcvForExistingQuotes } from "./providers/ingestion.js";
 import { backfillMarginHistory } from "./providers/margin.js";
 import { backfillReasons } from "./analysis/index.js";
-import { runOnce } from "./graph/index.js";
+import { runOnce, runSnapshot } from "./graph/index.js";
 import { classifyTodayNews } from "./news/index.js";
 import { predictAllTargets } from "./prediction/index.js";
 import { buildNotifier } from "./notify/index.js";
@@ -96,10 +96,28 @@ async function main(): Promise<void> {
   // 常驻模式
   await initIfEmpty();
 
-  // 北京时间每个交易日（周一到周五）14:00 触发
-  // node-cron v3 支持 timezone 选项
+  // 北京时间每个交易日（周一到周五）14:40 触发盘中快照（行情+多维数据入库，不预测）
+  const snapshotTask = cron.schedule(
+    "40 14 * * 1-5",
+    async () => {
+      try {
+        await runSnapshot({ dryRun: false });
+      } catch (e) {
+        logStage({
+          stage: "cron.snapshot_failed",
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    },
+    { timezone: "Asia/Shanghai" }
+  );
+  snapshotTask.start();
+  logStage({ stage: "cron.snapshot_registered", ok: true, expr: "40 14 * * 1-5", tz: "Asia/Shanghai" });
+
+  // 北京时间每个交易日（周一到周五）15:30 触发收盘后完整流程（更新收盘价+分析+预测+通知）
   const task = cron.schedule(
-    "0 14 * * 1-5",
+    "30 15 * * 1-5",
     async () => {
       try {
         await runOnce({ dryRun: false });
@@ -114,7 +132,7 @@ async function main(): Promise<void> {
     { timezone: "Asia/Shanghai" }
   );
   task.start();
-  logStage({ stage: "cron.registered", ok: true, expr: "0 14 * * 1-5", tz: "Asia/Shanghai" });
+  logStage({ stage: "cron.run_registered", ok: true, expr: "30 15 * * 1-5", tz: "Asia/Shanghai" });
 
   // 北京时间每个交易日 16:00 触发盘后回顾 + AI 准确率分析
   const reviewTask = cron.schedule(
@@ -163,6 +181,7 @@ async function main(): Promise<void> {
   // 防止进程退出
   process.on("SIGINT", () => {
     logStage({ stage: "shutdown", ok: true, signal: "SIGINT" });
+    snapshotTask.stop();
     task.stop();
     reviewTask.stop();
     newsTask.stop();

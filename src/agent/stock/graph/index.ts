@@ -239,7 +239,7 @@ export function buildContextSystemMessage(
   return new SystemMessage(`${header.join(" ")}\n\n${blocks.join("\n\n")}`);
 }
 
-// ==================== runOnce（直接函数调用，不走 LLM 决策）====================
+// ==================== runOnce / runSnapshot（直接函数调用，不走 LLM 决策）====================
 
 export interface RunOnceOptions {
   dryRun?: boolean;
@@ -261,6 +261,43 @@ async function safeStep<T>(label: string, fn: () => Promise<T>): Promise<T | nul
     });
     return null;
   }
+}
+
+/**
+ * 收盘前盘中快照：仅拉行情+多维度数据，不预测不发通知。
+ * 用于 14:40 等盘中时刻记录实时点位，收盘后 runOnce 再覆盖为收盘价。
+ */
+export async function runSnapshot(opts: RunOnceOptions = {}): Promise<void> {
+  // 1) 主行情入库（必需）
+  const ingested = await timed("ingest_quote_snapshot", undefined, () => ingestToday(defaultProvider));
+  const today = todayShanghai();
+
+  if (ingested.length === 0) {
+    logStage({ stage: "runSnapshot.skip_non_trading", ok: true, today });
+    return;
+  }
+  const tradeDate = ingested[0].trade_date;
+
+  // 2) 各指数原因分析（盘中快照也做，供后续查看）
+  for (const row of ingested) {
+    await safeStep(`analyze_${row.index_code}`, () =>
+      analyzeChangeReason(row.index_code, row.trade_date)
+    );
+  }
+
+  // 3) 多维度数据采集（全部 fail-safe）
+  await safeStep("ingest_margin", () => ingestLatestMargin());
+  await safeStep("ingest_breadth", () => ingestMarketBreadth(tradeDate));
+  await safeStep("ingest_sector", () => ingestSectorRotation(tradeDate));
+  await safeStep("ingest_lhb", () => ingestLhb(tradeDate));
+  await safeStep("classify_news", () => classifyTodayNews(today));
+  await safeStep("ingest_external", () => ingestExternalProxies(tradeDate));
+  await safeStep("ingest_futures", () => ingestFuturesBasis(tradeDate));
+  await safeStep("seed_macro", async () => {
+    ensureRecentMacroSeed(tradeDate);
+  });
+
+  logStage({ stage: "runSnapshot.done", ok: true, tradeDate, indices: ingested.map((r) => r.index_code) });
 }
 
 export async function runOnce(opts: RunOnceOptions = {}): Promise<void> {
