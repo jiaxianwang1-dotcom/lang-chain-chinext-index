@@ -8,6 +8,7 @@
     "stock:once": "tsx src/agent/stock/main.ts --once",
     "stock:dry-run": "tsx src/agent/stock/main.ts --once --dry-run",
     "stock:self-check": "tsx src/agent/stock/main.ts --self-check",
+    "stock:fix-quotes": "tsx src/agent/stock/fix-quotes.ts",
     "test": "vitest run"
   },
   "dependencies": {

@@ -1,6 +1,6 @@
 // PM2 配置：两个常驻进程
 //   1) stock-web  : Express + LangGraph，对外提供 Web UI 与 /api/* 接口
-//   2) stock-cron : node-cron 常驻，北京时间每个交易日 14:00 触发预测 + 短信
+//   2) stock-cron : node-cron 常驻，北京时间每个交易日 14:40 盘中快照 + 15:30 收盘后预测 + 短信
 //
 // 启动：pm2 start ecosystem.config.cjs
 // 仅启动其一：pm2 start ecosystem.config.cjs --only stock-web
