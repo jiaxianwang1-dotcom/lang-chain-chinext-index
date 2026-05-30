@@ -256,18 +256,37 @@
     .acc-reviews-table td.miss { color: #c0392b; }
     .acc-reviews-table td.up { color: #c0392b; }
     .acc-reviews-table td.down { color: #27ae60; }
+    .acc-reviews-table td .acc-analysis-wrap {
+      max-width: 320px;
+      text-align: left;
+    }
     .acc-reviews-table td .acc-analysis {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       font-size: 11px;
       color: #444;
       line-height: 1.4;
       text-align: left;
-      max-width: 320px;
       overflow: hidden;
       text-overflow: ellipsis;
       display: -webkit-box;
       -webkit-line-clamp: 3;
       -webkit-box-orient: vertical;
+    }
+    .acc-reviews-table td .acc-analysis.expanded {
+      -webkit-line-clamp: unset;
+      display: block;
+      overflow: visible;
+    }
+    .acc-reviews-table td .acc-analysis-toggle {
+      color: #667eea;
+      font-size: 10px;
+      cursor: pointer;
+      margin-top: 2px;
+      display: inline-block;
+      user-select: none;
+    }
+    .acc-reviews-table td .acc-analysis-toggle:hover {
+      text-decoration: underline;
     }
 
     /* ========== 多信号面板 Tab 样式 ========== */

@@ -124,7 +124,7 @@
         const key = `${r.index_code}:${r.target_date}`;
         const ana = analysisMap?.get(key);
         const anaHtml = ana
-          ? `<div class="acc-analysis" title="${escapeHtml(ana.analysis_summary)}">${escapeHtml(ana.analysis_summary)}</div>`
+          ? `<div class="acc-analysis-wrap"><div class="acc-analysis" title="${escapeHtml(ana.analysis_summary)}">${escapeHtml(ana.analysis_summary)}</div><span class="acc-analysis-toggle">展开</span></div>`
           : `<span style="color:#999;font-size:11px;">-</span>`;
         return `
           <tr>
@@ -210,6 +210,18 @@
   indexSel.addEventListener("change", loadAll);
   reloadBtn.addEventListener("click", loadAll);
   refreshBtn.addEventListener("click", refreshReviews);
+
+  // 点击展开/收起 AI 预测准确率分析
+  tbody.addEventListener("click", (e) => {
+    const toggle = e.target.closest(".acc-analysis-toggle");
+    if (!toggle) return;
+    const wrap = toggle.closest(".acc-analysis-wrap");
+    if (!wrap) return;
+    const analysis = wrap.querySelector(".acc-analysis");
+    if (!analysis) return;
+    const isExpanded = analysis.classList.toggle("expanded");
+    toggle.textContent = isExpanded ? "收起" : "展开";
+  });
 
   let loaded = false;
   window.AccuracyTab = {
