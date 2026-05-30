@@ -226,7 +226,7 @@ describe("predictNextTradingDay (multi-signal 多维度模式 默认)", () => {
 
     const stored = getLatestMemory("000001.SH");
     const f = JSON.parse(stored!.features);
-    expect(f.last_prediction.mode).toBe("multi-signal-v2");
+    expect(f.last_prediction.mode).toBe("multi-signal-v3");
     expect(f.last_prediction.signals).toBeDefined();
     expect(f.last_prediction.dimensions_used).toBeGreaterThanOrEqual(2);
   });

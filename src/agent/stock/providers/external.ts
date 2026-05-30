@@ -45,7 +45,7 @@ const SYMBOLS = {
   HSTECH: {
     source: "tencent",
     code: "hkHSTECH",
-    eastmoney: null, // 东财没有公开 secid，主源失败时直接走雅虎
+    eastmoney: null,
     yahoo: "^HSTECH",
   },
   "510300": {
@@ -59,6 +59,20 @@ const SYMBOLS = {
     code: "sz159915",
     eastmoney: { secid: "0.159915", priceScale: 1000, pctScale: 100 },
     yahoo: "159915.SZ",
+  },
+  // P3 新增：富时中国 A50 指数期货（新加坡交易所，反映外资隔夜情绪）
+  A50: {
+    source: "yahoo_only",
+    code: "a50",
+    eastmoney: null,
+    yahoo: "CN=F",
+  },
+  // P3 新增：中概互联网 ETF（反映美股中概情绪）
+  KWEB: {
+    source: "yahoo_only",
+    code: "kweb",
+    eastmoney: null,
+    yahoo: "KWEB",
   },
 } as const;
 
@@ -221,6 +235,22 @@ async function fetchYahooQuote(yahooSymbol: string, displaySymbol: string): Prom
 
 async function fetchOne(key: SymbolKey): Promise<FetchedQuote | null> {
   const spec = SYMBOLS[key];
+
+  // yahoo_only 品种（A50期货、中概股ETF）直接走雅虎，跳过国内源
+  if (spec.source === "yahoo_only") {
+    try {
+      const q = await fetchYahooQuote(spec.yahoo, key);
+      if (q) return q;
+    } catch (e) {
+      logStage({
+        stage: `external.yahoo_only_failed_${key}`,
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+    return null;
+  }
+
   // 1) 主源（sina/腾讯）
   try {
     const primary =

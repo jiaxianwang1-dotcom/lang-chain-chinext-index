@@ -483,6 +483,79 @@ async function fetchQQNews(limit = 15): Promise<RawHeadline[]> {
   }
 }
 
+/** 东方财富 7x24 快讯 */
+async function fetchEastmoneyNews(limit = 15): Promise<RawHeadline[]> {
+  const url = `https://np-listapi.eastmoney.com/comm/web/urgent?client=web&biz=urgent&pageSize=${Math.max(limit, 20)}`;
+  try {
+    const res = await fetchWithTimeout(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        Referer: "https://finance.eastmoney.com/",
+      },
+    }, 30000);
+    if (!res.ok) {
+      logStage({ stage: "news.eastmoney_http_failed", ok: false, status: res.status });
+      return [];
+    }
+    const data = (await res.json()) as {
+      code?: number;
+      data?: { list?: Array<{ title?: string; url?: string }> };
+    };
+    if (data.code !== 0) {
+      logStage({ stage: "news.eastmoney_api_failed", ok: false, code: data.code });
+      return [];
+    }
+    const items = data.data?.list ?? [];
+    const out: RawHeadline[] = [];
+    for (const item of items) {
+      const title = item.title?.trim();
+      if (title && title.length >= 6 && title.length < 200) {
+        out.push({ title, url: item.url, source: "eastmoney_7x24" });
+      }
+      if (out.length >= limit) break;
+    }
+    logStage({ stage: "news.eastmoney_ok", ok: true, count: out.length });
+    return out;
+  } catch (e) {
+    logStage({ stage: "news.eastmoney_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
+    return [];
+  }
+}
+
+/** 同花顺财经要闻 */
+async function fetchThsNews(limit = 15): Promise<RawHeadline[]> {
+  const url = "https://basic.10jqka.com.cn/api/stockph/";
+  try {
+    const res = await fetchWithTimeout(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        Referer: "https://basic.10jqka.com.cn/",
+      },
+    }, 30000);
+    if (!res.ok) {
+      logStage({ stage: "news.ths_http_failed", ok: false, status: res.status });
+      return [];
+    }
+    const data = (await res.json()) as {
+      data?: Array<{ title?: string; url?: string }>;
+    };
+    const items = data.data ?? [];
+    const out: RawHeadline[] = [];
+    for (const item of items) {
+      const title = item.title?.trim();
+      if (title && title.length >= 6 && title.length < 200) {
+        out.push({ title, url: item.url, source: "ths_finance" });
+      }
+      if (out.length >= limit) break;
+    }
+    logStage({ stage: "news.ths_ok", ok: true, count: out.length });
+    return out;
+  } catch (e) {
+    logStage({ stage: "news.ths_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
+    return [];
+  }
+}
+
 /** 限制并发数执行异步任务。 */
 async function runWithConcurrencyLimit<T>(tasks: (() => Promise<T>)[], limit: number): Promise<T[]> {
   const results: T[] = [];
@@ -587,7 +660,7 @@ async function _classifyTodayNewsImpl(
     }
   });
 
-  const [searchResults, sinaHeadlines, _163Headlines, qqHeadlines] = await Promise.all([
+  const [searchResults, sinaHeadlines, _163Headlines, qqHeadlines, emHeadlines, thsHeadlines] = await Promise.all([
     runWithConcurrencyLimit(searchTasks, 2),
     fetchSinaNews(15).catch((e) => {
       logStage({ stage: "news.sina_fetch_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
@@ -601,6 +674,14 @@ async function _classifyTodayNewsImpl(
       logStage({ stage: "news.qq_fetch_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
       return [] as RawHeadline[];
     }),
+    fetchEastmoneyNews(15).catch((e) => {
+      logStage({ stage: "news.eastmoney_fetch_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
+      return [] as RawHeadline[];
+    }),
+    fetchThsNews(15).catch((e) => {
+      logStage({ stage: "news.ths_fetch_failed", ok: false, error: e instanceof Error ? e.message : String(e) });
+      return [] as RawHeadline[];
+    }),
   ]);
 
   const headlines: RawHeadline[] = [];
@@ -612,7 +693,9 @@ async function _classifyTodayNewsImpl(
   headlines.push(...sinaHeadlines);
   headlines.push(..._163Headlines);
   headlines.push(...qqHeadlines);
-  logStage({ stage: "news.fetched", ok: true, sina: sinaHeadlines.length, _163: _163Headlines.length, qq: qqHeadlines.length, elapsed_ms: Date.now() - searchStart });
+  headlines.push(...emHeadlines);
+  headlines.push(...thsHeadlines);
+  logStage({ stage: "news.fetched", ok: true, sina: sinaHeadlines.length, _163: _163Headlines.length, qq: qqHeadlines.length, eastmoney: emHeadlines.length, ths: thsHeadlines.length, elapsed_ms: Date.now() - searchStart });
 
   // 去重（按 title）
   const dedup: RawHeadline[] = [];

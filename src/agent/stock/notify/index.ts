@@ -62,9 +62,11 @@ export function renderSmsContent(predictions: PredictionResult[]): {
 } {
   const time = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
   const parts = predictions.map((p) => {
-    const dirText = p.direction === "up" ? "买涨" : "买跌";
-    const conf = (p.confidence * 100).toFixed(1) + "%";
-    return `${p.index_name}${dirText}(置信度${conf})`;
+    const dirText = p.direction === "up" ? "买涨" : p.direction === "down" ? "买跌" : "观望";
+    const conf = p.calibrated_confidence != null
+      ? `校准置信度${(p.calibrated_confidence * 100).toFixed(1)}%`
+      : `置信度${(p.confidence * 100).toFixed(1)}%`;
+    return `${p.index_name}${dirText}(${conf})`;
   });
   const content = parts.join("，");
   return { content, time };

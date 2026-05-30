@@ -5,14 +5,7 @@ import { getLhbForIndex } from "../providers/lhb.js";
  * 本地异动信号计算（不依赖外部 API）。
  *
  * 输入：单只指数 index_code
- * 输出：
- *   - volume_ratio: 当日 volume / 近 30 日均 volume
- *   - is_high_volume: volume_ratio > 1.5
- *   - is_low_volume: volume_ratio < 0.7
- *   - abnormal_silent: 高量但 |chg%| < 1.0  → "有人在动但价格没怎么动"
- *   - lhb_active: 当日龙虎榜中影响该指数的成分股数量 > 0
- *   - lhb_net_amount: 影响该指数的成分股净买入合计
- *   - notes: 文字描述（用于直接拼到 prompt）
+ * 输出：量比、高量低波、跳空缺口、连涨连跌、RSI、龙虎榜等异动信号
  */
 
 export interface AnomalySignals {
@@ -24,6 +17,15 @@ export interface AnomalySignals {
   lhb_active: boolean;
   lhb_count: number;
   lhb_net_amount: number;
+  /** 近期缺口描述 */
+  gap_note: string;
+  /** 连涨/连跌天数 */
+  streak_count: number;
+  streak_direction: "up" | "down" | "flat";
+  /** RSI(14) 最新值 */
+  rsi: number | null;
+  /** 20日 realized volatility */
+  realized_volatility: number | null;
   notes: string[];
 }
 
@@ -31,6 +33,78 @@ function avgVolume(rows: IndexQuoteRow[]): number | null {
   const vs = rows.map((r) => r.volume).filter((v): v is number => v != null && Number.isFinite(v) && v > 0);
   if (vs.length === 0) return null;
   return vs.reduce((a, b) => a + b, 0) / vs.length;
+}
+
+function sma(arr: number[], n: number): number | null {
+  if (arr.length < n) return null;
+  const slice = arr.slice(-n);
+  return slice.reduce((a, b) => a + b, 0) / n;
+}
+
+function rsiLatest(closes: number[]): number | null {
+  if (closes.length < 15) return null;
+  let gains = 0;
+  let losses = 0;
+  for (let i = closes.length - 14; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff > 0) gains += diff;
+    else losses += -diff;
+  }
+  const avgGain = gains / 14;
+  const avgLoss = losses / 14;
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - 100 / (1 + rs);
+}
+
+function findRecentGap(rows: IndexQuoteRow[]): string {
+  if (rows.length < 3) return "无足够数据";
+  for (let i = rows.length - 1; i >= 1; i--) {
+    const today = rows[i];
+    const prev = rows[i - 1];
+    if (today.high_value == null || prev.low_value == null || today.low_value == null || prev.high_value == null) continue;
+    if (today.low_value > prev.high_value) {
+      const gap = today.low_value - prev.high_value;
+      return `${today.trade_date} 向上缺口 ${gap.toFixed(2)} 点`;
+    }
+    if (today.high_value < prev.low_value) {
+      const gap = prev.low_value - today.high_value;
+      return `${today.trade_date} 向下缺口 ${gap.toFixed(2)} 点`;
+    }
+  }
+  return "近期无显著缺口";
+}
+
+function consecutiveDays(rows: IndexQuoteRow[]): { direction: "up" | "down" | "flat"; count: number } {
+  if (rows.length < 2) return { direction: "flat", count: 0 };
+  let dir: "up" | "down" | "flat" = "flat";
+  let count = 0;
+  for (let i = rows.length - 1; i >= 1; i--) {
+    const chg = rows[i].change_pct ?? 0;
+    const currDir = chg > 0.01 ? "up" : chg < -0.01 ? "down" : "flat";
+    if (count === 0) {
+      dir = currDir;
+      count = 1;
+      continue;
+    }
+    if (currDir === dir || (Math.abs(chg) <= 0.01 && dir !== "flat")) {
+      count++;
+    } else {
+      break;
+    }
+  }
+  return { direction: dir, count };
+}
+
+function realizedVolatility(rows: IndexQuoteRow[], days = 20): number | null {
+  const pcts = rows
+    .slice(-days)
+    .map((r) => r.change_pct)
+    .filter((v): v is number => v != null && Number.isFinite(v));
+  if (pcts.length < 5) return null;
+  const mean = pcts.reduce((a, b) => a + b, 0) / pcts.length;
+  const variance = pcts.reduce((sum, v) => sum + (v - mean) ** 2, 0) / pcts.length;
+  return Math.sqrt(variance);
 }
 
 export function computeAnomalySignals(indexCode: string): AnomalySignals {
@@ -45,6 +119,11 @@ export function computeAnomalySignals(indexCode: string): AnomalySignals {
       lhb_active: false,
       lhb_count: 0,
       lhb_net_amount: 0,
+      gap_note: "<无行情数据>",
+      streak_count: 0,
+      streak_direction: "flat",
+      rsi: null,
+      realized_volatility: null,
       notes: ["<无行情数据，无法计算异动>"],
     };
   }
@@ -69,6 +148,14 @@ export function computeAnomalySignals(indexCode: string): AnomalySignals {
   const is_low_volume = ratio != null && ratio < 0.7;
   const todayChgAbs = latest.change_pct != null ? Math.abs(latest.change_pct) : 0;
   const abnormal_silent = is_high_volume && todayChgAbs < 1.0;
+
+  // 技术指标
+  const allRecent = getQuotesInRange(indexCode, startNatural, trade_date);
+  const closes = allRecent.map((r) => r.close_value).filter((v): v is number => Number.isFinite(v));
+  const gap_note = findRecentGap(allRecent);
+  const streak = consecutiveDays(allRecent);
+  const rsi = rsiLatest(closes);
+  const rv = realizedVolatility(allRecent, 20);
 
   // 龙虎榜异动（用最近一天 lhb 数据；如果当日还没出，会拿不到）
   let lhb_active = false;
@@ -100,6 +187,18 @@ export function computeAnomalySignals(indexCode: string): AnomalySignals {
       `⚠ 量价背离：高量但当日 chg% 仅 ${latest.change_pct?.toFixed(2)}% — 疑似有人在静默吸筹/出货`
     );
   }
+  notes.push(`缺口: ${gap_note}`);
+  if (streak.count >= 3) {
+    notes.push(
+      `⚠ 连续${streak.direction === "up" ? "上涨" : "下跌"}${streak.count}天 — 均值回归风险上升`
+    );
+  }
+  if (rsi != null) {
+    notes.push(`RSI(14)=${rsi.toFixed(1)}${rsi > 70 ? " (超买)" : rsi < 30 ? " (超卖)" : ""}`);
+  }
+  if (rv != null) {
+    notes.push(`20日 realized vol=${rv.toFixed(3)}%`);
+  }
   if (lhb_active) {
     notes.push(
       `龙虎榜：${lhb_count} 只成分股上榜，净买入合计 ${(lhb_net_amount / 1e8).toFixed(2)}亿`
@@ -117,6 +216,11 @@ export function computeAnomalySignals(indexCode: string): AnomalySignals {
     lhb_active,
     lhb_count,
     lhb_net_amount,
+    gap_note,
+    streak_count: streak.count,
+    streak_direction: streak.direction,
+    rsi,
+    realized_volatility: rv,
     notes,
   };
 }

@@ -3,6 +3,7 @@ import cron from "node-cron";
 import { getDb } from "./db/index.js";
 import { backfillOneYear, refreshOhlcvForExistingQuotes } from "./providers/ingestion.js";
 import { backfillMarginHistory } from "./providers/margin.js";
+import { ingestExternalProxies } from "./providers/external.js";
 import { backfillReasons } from "./analysis/index.js";
 import { runOnce, runSnapshot } from "./graph/index.js";
 import { classifyTodayNews } from "./news/index.js";
@@ -156,9 +157,30 @@ async function main(): Promise<void> {
   reviewTask.start();
   logStage({ stage: "cron.review_registered", ok: true, expr: "0 16 * * 1-5", tz: "Asia/Shanghai" });
 
-  // 每天 9:00 / 18:00 采集新闻（新闻不受交易日限制，周末/节假日也可能有政策）
+  // 每天 8:00 采集外部代理（A50期货、中概股等隔夜数据）
+  const externalTask = cron.schedule(
+    "0 8 * * *",
+    async () => {
+      try {
+        logStage({ stage: "cron.external_start", ok: true });
+        await ingestExternalProxies();
+        logStage({ stage: "cron.external_done", ok: true });
+      } catch (e) {
+        logStage({
+          stage: "cron.external_failed",
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    },
+    { timezone: "Asia/Shanghai" }
+  );
+  externalTask.start();
+  logStage({ stage: "cron.external_registered", ok: true, expr: "0 8 * * *", tz: "Asia/Shanghai" });
+
+  // 每天 9:00 / 11:00 / 13:00 / 18:00 采集新闻（新闻不受交易日限制，周末/节假日也可能有政策）
   const newsTask = cron.schedule(
-    "0 9,18 * * *",
+    "0 9,11,13,18 * * *",
     async () => {
       try {
         const today = todayShanghai();
@@ -176,7 +198,36 @@ async function main(): Promise<void> {
     { timezone: "Asia/Shanghai" }
   );
   newsTask.start();
-  logStage({ stage: "cron.news_registered", ok: true, expr: "0 9,18 * * *", tz: "Asia/Shanghai" });
+  logStage({ stage: "cron.news_registered", ok: true, expr: "0 9,11,13,18 * * *", tz: "Asia/Shanghai" });
+
+  // 北京时间每个交易日 14:50 触发盘中预预测（dry-run，不发短信，用于对比尾盘变化）
+  const intradayPredictTask = cron.schedule(
+    "50 14 * * 1-5",
+    async () => {
+      try {
+        logStage({ stage: "cron.intraday_predict_start", ok: true });
+        const preds = await predictAllTargets();
+        logStage({
+          stage: "cron.intraday_predict_done",
+          ok: true,
+          predictions: preds.map((p) => ({
+            index: p.index_code,
+            dir: p.direction,
+            conf: p.confidence,
+          })),
+        });
+      } catch (e) {
+        logStage({
+          stage: "cron.intraday_predict_failed",
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    },
+    { timezone: "Asia/Shanghai" }
+  );
+  intradayPredictTask.start();
+  logStage({ stage: "cron.intraday_predict_registered", ok: true, expr: "50 14 * * 1-5", tz: "Asia/Shanghai" });
 
   // 防止进程退出
   process.on("SIGINT", () => {
@@ -184,7 +235,9 @@ async function main(): Promise<void> {
     snapshotTask.stop();
     task.stop();
     reviewTask.stop();
+    externalTask.stop();
     newsTask.stop();
+    intradayPredictTask.stop();
     process.exit(0);
   });
 }

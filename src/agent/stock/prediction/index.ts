@@ -31,6 +31,7 @@ import { getMacroEventsAround, ensureRecentMacroSeed } from "../providers/macro.
 import { logStage } from "../utils/log.js";
 import { todayShanghai } from "../realtime/range.js";
 import { createKimiCliInvoke } from "./kimi-cli-invoke.js";
+import { calibrateConfidence } from "../review/calibration.js";
 
 // ==================== Schemas ====================
 
@@ -57,7 +58,7 @@ const SignalLeanEnum = z.enum(["up", "down", "neutral", "missing"]);
 const MagnitudeBucketEnum = z.enum(["small", "medium", "large"]);
 
 const MultiSignalPredictionSchema = z.object({
-  direction: z.enum(["up", "down"]),
+  direction: z.enum(["up", "down", "hold"]),
   confidence: z.number().min(0).max(1),
   /** P0：预测涨跌幅中位数（带符号 %）。例如 +0.85 表示预测上涨 0.85%。 */
   predicted_change_pct: z.number().min(-10).max(10).optional(),
@@ -92,7 +93,7 @@ export type MagnitudeBucket = z.infer<typeof MagnitudeBucketEnum>;
 export interface PredictionResult {
   index_code: string;
   index_name: string;
-  direction: "up" | "down";
+  direction: "up" | "down" | "hold";
   confidence: number;
   rationale: string;
   as_of_date: string;
@@ -106,6 +107,8 @@ export interface PredictionResult {
   predicted_change_pct_low?: number;
   predicted_change_pct_high?: number;
   magnitude_bucket?: MagnitudeBucket;
+  /** 校准后的置信度（基于历史 calibration curve） */
+  calibrated_confidence?: number;
 }
 
 // ==================== LLM ====================
@@ -119,7 +122,7 @@ function getDefaultLlm(): ChatOpenAI {
     model: process.env.KIMI_MODEL ?? "kimi-k2.6",
     apiKey: process.env.KIMI_API_KEY,
     configuration: { baseURL: process.env.KIMI_BASE_URL ?? "https://api.moonshot.cn/v1" },
-    temperature: process.env.KIMI_MODEL?.includes("k2.6") ? 1 : 0.2,
+    temperature: process.env.KIMI_MODEL?.includes("k2.6") ? 0.3 : 0.2,
   });
   return _defaultLlm;
 }
@@ -191,11 +194,12 @@ date / open / high / low / close / chg% / volume / reason
 
 export function buildMultiSignalSystemPrompt(indexName = "大盘"): string {
   const prefix = indexName === "上证指数" || indexName === "大盘" ? "A 股大盘" : indexName;
-  return `你是 ${prefix}短线方向 + 涨跌幅判断助手（多信号模式 v2）。
+  return `你是 ${prefix}短线方向 + 涨跌幅判断助手（多信号模式 v3）。
 
-你将收到 **最多 10 个维度**的真实数据用于分析"下一交易日"方向（"up"=买涨 / "down"=买跌）以及预测涨跌幅区间：
+你将收到 **最多 10 个维度 + 预计算技术指标**的真实数据用于分析"下一交易日"方向（"up"=买涨 / "down"=买跌 / "hold"=方向不明，建议观望）以及预测涨跌幅区间：
 
 【维度 1：价格趋势】近 30 日 OHLCV 明细 + 60/90 日统计摘要
+【维度 1b：预计算技术指标】MA5/MA10/MA20、MACD(12,26,9)、RSI(14)、布林带(20,2)、近期跳空缺口、连涨/连跌天数
 【维度 2：量能】当日量比、近 30 日均量、量价配合
 【维度 3：资金面】两融余额（融资净买入近 5 日序列，T-1 滞后）
 【维度 4：市场广度】沪深创三市当日 涨/跌/平 家数 + 涨停数
@@ -206,28 +210,37 @@ export function buildMultiSignalSystemPrompt(indexName = "大盘"): string {
 【维度 9：外资情绪代理】CNH 离岸人民币 / 恒生指数 / 沪深 300 ETF / 创业板 ETF 当日表现（**注意：北向资金 2024-08 起停止公开，这里用代理指标替代**）
 【维度 10：股指期货升贴水】IF/IH/IC/IM 主力连续合约相对现货的 basis 与 basis_pct（升水=机构看多远期 / 贴水=机构看空远期）
 
+============ 维度权重优先级（降序，供你权衡时参考） ============
+
+1. 宏观政策/重大新闻（维度 7、8）—— A 股是政策市，政策权重最高
+2. 期货升贴水 + 外资代理（维度 9、10）—— 反映机构真实态度
+3. 龙虎榜 + 两融（维度 3、6）—— 大资金动向
+4. 量价趋势 + 技术指标（维度 1、1b、2）—— 技术面验证
+5. 板块轮动 + 市场广度（维度 4、5）—— 市场情绪
+
 ============ 硬性纪律（违反则视为不合格输出）============
 
-A. **禁止编造**：你只能引用上述 10 维数据中**实际出现的数字与文本**。如果某维度被标注 "<数据缺失>"，rationale 中 MUST NOT 编造该维度的数字。
-A2. **禁止张冠李戴**：引用 30 日明细中的具体日期与数值时，必须严格一一对应。不得把其他交易日的 close/change_pct/volume 数据套用到错误日期上。若记不清某日的具体数字，宁可不引用该日，也不准猜测或挪用。
-B. **direction 必须二选一**：不允许中立 / 震荡 / 看不清。
-C. **维度覆盖**：rationale ≤ 280 字，**至少引用 4 个不同维度**的具体证据，且每条证据必须包含具体数字或专有名词（例：板块名 / 股票名 / 事件标题片段）。
-D. **维度冲突时降低置信度**：当多个维度方向相反（例如价格上涨但融资资金净流出 + 当日新闻偏负面）时，confidence MUST 在 [0.55, 0.65]，且 rationale 必须明确指出"维度冲突"或"分歧"。
+A. **禁止编造**：你只能引用上述数据中**实际出现的数字与文本**。如果某维度被标注 "<数据缺失>"，rationale 中 MUST NOT 编造该维度的数字。
+A2. **禁止张冠李戴**：引用明细中的具体日期与数值时，必须严格一一对应。不得把其他交易日的数据套用到错误日期上。若记不清，宁可不引用，也不准猜测。
+B. **direction 允许 hold**：当多个核心维度（政策/期货/龙虎榜/新闻）方向互相矛盾，或信号极其微弱时，**必须**输出 "hold"，不要强行二选一。hold 时 confidence 应在 [0.50, 0.58]。
+C. **维度覆盖**：rationale ≤ 280 字，引用**你认为重要**的维度（≥2 个），每条证据必须包含具体数字或专有名词。不重要的维度不必硬凑。
+D. **维度冲突时降低置信度或 hold**：当核心维度方向相反（例如技术面向多但期货深度贴水 + 新闻偏负面）时，优先降低 confidence 到 [0.55, 0.65]；若冲突严重，直接给 hold。
 E. **置信度梯度**：
-   - 多维度（≥ 5）一致同向 + 信号明确 → 0.75–0.90
+   - 多核心维度（政策/期货/资金）一致同向 + 信号明确 → 0.75–0.90
    - 多维度一致但信号温和 → 0.65–0.75
-   - 主导维度不足 / 冲突 → 0.55–0.65
-   - 数据混乱 / 缺维度 ≥ 4 → 0.50–0.60
-   不允许 0.95+ 极端值，也不允许刻意压低到 0.5 以下。
+   - 主导维度不足 / 非核心维度冲突 → 0.55–0.65
+   - 核心维度冲突 / 数据混乱 / 缺维度 ≥ 4 → 0.50–0.60（或 hold）
+   不允许 0.95+ 极端值，也不允许刻意压低到 0.48 以下。
 
-============ 涨跌幅与档位（P0 v2 新增） ============
+============ 涨跌幅与档位 ============
 
-F. **predicted_change_pct**: 带符号小数，单位 %。需与 direction 一致（up>0，down<0）。
+F. **predicted_change_pct**: 带符号小数，单位 %。需与 direction 一致（up>0，down<0，hold=0）。
    A 股指数单日 95% 概率落在 ±2.5%，超过 ±3% 必须由"维度 6 龙虎榜爆量 / 维度 4 涨停潮 / 维度 7 重大事件"明确支撑。
 G. **区间预测**: predicted_change_pct_low 与 predicted_change_pct_high 给出 ~70% 置信区间。
-   规则：区间宽度 = max(0.4, 1.2 - confidence)，例如 confidence=0.75 → 宽度 ≈ 0.45%。
+   规则：区间宽度参考近20日 realized volatility（已提供）。confidence 越高，区间可越窄。
    方向是 up 时：low ≥ -0.3，high > predicted_change_pct；
-   方向是 down 时：high ≤ +0.3，low < predicted_change_pct。
+   方向是 down 时：high ≤ +0.3，low < predicted_change_pct；
+   hold 时：区间以 0 为中心对称，如 -0.4 ~ +0.4。
    low 必须严格 ≤ high。
 H. **magnitude_bucket**: 按 |predicted_change_pct| 判档位：
    |x| < 0.5%  → "small"
@@ -244,19 +257,23 @@ H. **magnitude_bucket**: 按 |predicted_change_pct| 判档位：
 - 期货明显升水（basis_pct > +0.3%）→ 机构看多，倾向上行
 - CNH 走强（人民币贬值）→ 外资倾向流出，谨慎
 - 恒指当日 +1% 以上 → 港股领涨往往传导到 A 股次日
+- RSI > 70 → 短期超买，追高风险
+- RSI < 30 → 短期超卖，反弹概率增加
+- 连涨 4+ 天 → 均值回归概率上升，不宜追高
+- 连跌 4+ 天 → 超跌反弹概率上升，不宜杀跌
 
 ============ 输出格式（严格 JSON，不要 Markdown）============
 
-⚠️ 严禁复制下面的示例数值！confidence / predicted_change_pct / low / high 必须根据上文真实数据独立计算，每次输出都应不同。
+⚠️ 严禁复制示例中的占位符数值（xx.yy / zz / ww）！所有数值必须根据上文真实数据独立计算。
 
 {
-  "direction": "up" | "down",
+  "direction": "up" | "down" | "hold",
   "confidence": 0.xx,
-  "predicted_change_pct": 0.yy,
-  "predicted_change_pct_low": 0.zz,
-  "predicted_change_pct_high": 0.ww,
+  "predicted_change_pct": xx.yy,
+  "predicted_change_pct_low": xx.zz,
+  "predicted_change_pct_high": xx.ww,
   "magnitude_bucket": "small" | "medium" | "large",
-  "rationale": "≤280 字中文，必须引用 4+ 维度的具体数字/专名",
+  "rationale": "≤280 字中文，引用重要维度的具体数字/专名",
   "signals": {
     "trend":     "up"|"down"|"neutral"|"missing",
     "volume":    "up"|"down"|"neutral"|"missing",
@@ -345,6 +362,194 @@ function formatRecentKeyDays(rows: IndexQuoteRow[], days = 5): string {
     );
   }
   return lines.join("\n");
+}
+
+// ==================== 技术指标预计算 ====================
+
+function sma(arr: number[], n: number): number | null {
+  if (arr.length < n) return null;
+  const slice = arr.slice(-n);
+  return slice.reduce((a, b) => a + b, 0) / n;
+}
+
+function ema(arr: number[], n: number): number | null {
+  if (arr.length < n) return null;
+  const k = 2 / (n + 1);
+  let e = arr[0];
+  for (let i = 1; i < arr.length; i++) {
+    e = arr[i] * k + e * (1 - k);
+  }
+  return e;
+}
+
+/** 计算 MACD(12,26,9)，返回最新值 */
+function macdLatest(closes: number[]): { dif: number | null; dea: number | null; macd: number | null } {
+  if (closes.length < 26) return { dif: null, dea: null, macd: null };
+  // 用 SMA 作为 EMA 的种子
+  const ema12 = (() => {
+    const seed = sma(closes.slice(0, 12), 12) ?? closes[0];
+    const k = 2 / 13;
+    let e = seed;
+    for (let i = 12; i < closes.length; i++) {
+      e = closes[i] * k + e * (1 - k);
+    }
+    return e;
+  })();
+  const ema26 = (() => {
+    const seed = sma(closes.slice(0, 26), 26) ?? closes[0];
+    const k = 2 / 27;
+    let e = seed;
+    for (let i = 26; i < closes.length; i++) {
+      e = closes[i] * k + e * (1 - k);
+    }
+    return e;
+  })();
+  const dif = ema12 - ema26;
+  // DEA 是 DIF 的 9 日 EMA
+  const difSeries: number[] = [];
+  {
+    const k12 = 2 / 13;
+    const k26 = 2 / 27;
+    let e12 = sma(closes.slice(0, 12), 12) ?? closes[0];
+    let e26 = sma(closes.slice(0, 26), 26) ?? closes[0];
+    for (let i = 12; i < closes.length; i++) {
+      e12 = closes[i] * k12 + e12 * (1 - k12);
+      if (i >= 26) {
+        e26 = closes[i] * k26 + e26 * (1 - k26);
+        difSeries.push(e12 - e26);
+      }
+    }
+  }
+  if (difSeries.length < 9) return { dif, dea: null, macd: null };
+  const dea = ema(difSeries, 9);
+  return { dif, dea, macd: dea != null ? (dif - dea) * 2 : null };
+}
+
+/** RSI(14) */
+function rsiLatest(closes: number[]): number | null {
+  if (closes.length < 15) return null;
+  let gains = 0;
+  let losses = 0;
+  for (let i = closes.length - 14; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff > 0) gains += diff;
+    else losses += -diff;
+  }
+  const avgGain = gains / 14;
+  const avgLoss = losses / 14;
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - 100 / (1 + rs);
+}
+
+/** 布林带(20,2) */
+function bollingerLatest(closes: number[]): { upper: number | null; lower: number | null; mid: number | null } {
+  if (closes.length < 20) return { upper: null, lower: null, mid: null };
+  const slice = closes.slice(-20);
+  const mid = slice.reduce((a, b) => a + b, 0) / slice.length;
+  const variance = slice.reduce((sum, v) => sum + (v - mid) ** 2, 0) / slice.length;
+  const std = Math.sqrt(variance);
+  return { upper: mid + 2 * std, lower: mid - 2 * std, mid };
+}
+
+/** 查找最近未回补缺口（向上/向下），返回描述 */
+function findRecentGap(rows: IndexQuoteRow[]): string {
+  if (rows.length < 3) return "无足够数据";
+  for (let i = rows.length - 1; i >= 1; i--) {
+    const today = rows[i];
+    const prev = rows[i - 1];
+    if (today.high_value == null || prev.low_value == null || today.low_value == null || prev.high_value == null) continue;
+    // 向上缺口：今日最低 > 昨日最高
+    if (today.low_value > prev.high_value) {
+      const gap = today.low_value - prev.high_value;
+      return `${today.trade_date} 向上缺口 ${gap.toFixed(2)} 点（低 ${today.low_value.toFixed(2)} > 昨高 ${prev.high_value.toFixed(2)}）`;
+    }
+    // 向下缺口：今日最高 < 昨日最低
+    if (today.high_value < prev.low_value) {
+      const gap = prev.low_value - today.high_value;
+      return `${today.trade_date} 向下缺口 ${gap.toFixed(2)} 点（高 ${today.high_value.toFixed(2)} < 昨低 ${prev.low_value.toFixed(2)}）`;
+    }
+  }
+  return "近期无显著缺口";
+}
+
+/** 连涨/连跌天数 */
+function consecutiveDays(rows: IndexQuoteRow[]): { direction: "up" | "down" | "flat"; count: number } {
+  if (rows.length < 2) return { direction: "flat", count: 0 };
+  let dir: "up" | "down" | "flat" = "flat";
+  let count = 0;
+  for (let i = rows.length - 1; i >= 1; i--) {
+    const chg = rows[i].change_pct ?? 0;
+    const prevChg = rows[i - 1].change_pct ?? 0;
+    const currDir = chg > 0.01 ? "up" : chg < -0.01 ? "down" : "flat";
+    if (count === 0) {
+      dir = currDir;
+      count = 1;
+      continue;
+    }
+    if (currDir === dir || (Math.abs(chg) <= 0.01 && dir !== "flat")) {
+      count++;
+    } else {
+      break;
+    }
+  }
+  return { direction: dir, count };
+}
+
+/** 近 N 日 realized volatility（change_pct 标准差） */
+function realizedVolatility(rows: IndexQuoteRow[], days = 20): number | null {
+  const pcts = rows
+    .slice(-days)
+    .map((r) => r.change_pct)
+    .filter((v): v is number => v != null && Number.isFinite(v));
+  if (pcts.length < 5) return null;
+  const mean = pcts.reduce((a, b) => a + b, 0) / pcts.length;
+  const variance = pcts.reduce((sum, v) => sum + (v - mean) ** 2, 0) / pcts.length;
+  return Math.sqrt(variance);
+}
+
+/** 把预计算的技术指标格式化为 prompt 文本 */
+function formatTechnicalIndicators(rows: IndexQuoteRow[]): string {
+  if (rows.length < 20) return "<技术指标：数据不足>";
+  const closes = rows.map((r) => r.close_value).filter((v): v is number => Number.isFinite(v));
+  if (closes.length < 20) return "<技术指标：收盘价数据不足>";
+
+  const ma5 = sma(closes, 5);
+  const ma10 = sma(closes, 10);
+  const ma20 = sma(closes, 20);
+  const macd = macdLatest(closes);
+  const rsi = rsiLatest(closes);
+  const bb = bollingerLatest(closes);
+  const gap = findRecentGap(rows);
+  const streak = consecutiveDays(rows);
+
+  const lines: string[] = [];
+  lines.push(`MA5=${ma5?.toFixed(2) ?? "-"} MA10=${ma10?.toFixed(2) ?? "-"} MA20=${ma20?.toFixed(2) ?? "-"} 当前=${closes[closes.length - 1].toFixed(2)}`);
+  if (ma5 && ma10 && ma20) {
+    const trend = ma5 > ma10 && ma10 > ma20 ? "多头排列" : ma5 < ma10 && ma10 < ma20 ? "空头排列" : "缠绕";
+    lines.push(`均线排列: ${trend}`);
+  }
+  lines.push(`MACD: DIF=${macd.dif?.toFixed(3) ?? "-"} DEA=${macd.dea?.toFixed(3) ?? "-"} MACD=${macd.macd?.toFixed(3) ?? "-"}`);
+  lines.push(`RSI(14)=${rsi?.toFixed(1) ?? "-"} ${rsi != null ? (rsi > 70 ? "(超买)" : rsi < 30 ? "(超卖)" : "") : ""}`);
+  lines.push(`布林带: 上轨=${bb.upper?.toFixed(2) ?? "-"} 中轨=${bb.mid?.toFixed(2) ?? "-"} 下轨=${bb.lower?.toFixed(2) ?? "-"}`);
+  lines.push(`缺口: ${gap}`);
+  lines.push(`连涨/连跌: ${streak.direction === "up" ? "连涨" : streak.direction === "down" ? "连跌" : "震荡"} ${streak.count} 天`);
+
+  return lines.join("\n");
+}
+
+/** 基于历史 realized volatility 计算推荐的区间半宽 */
+function volatilityBasedHalfWidth(rows: IndexQuoteRow[], confidence: number): number {
+  const rv = realizedVolatility(rows, 20);
+  if (rv == null) {
+    // 回退到原来的公式
+    return Math.max(0.2, (1.2 - Math.min(0.95, Math.max(0.5, confidence))) / 2);
+  }
+  // realized vol 是日 change_pct 的标准差，约 68% 概率落在 ±1σ
+  // 我们想要约 70% 置信区间，用 1.0σ 作为基准
+  // confidence 越高，区间可以越窄（模型越确定）
+  const sigmaMultiplier = Math.max(0.5, 1.5 - confidence);
+  return Math.max(0.15, rv * sigmaMultiplier);
 }
 
 // ==================== Bootstrap ====================
@@ -592,19 +797,35 @@ function inferBucket(absPct: number): MagnitudeBucket {
  * 规范化 LLM 输出：保证 direction / predicted_change_pct / range / bucket 自洽。
  *
  * 规则：
- *   1. 若缺 predicted_change_pct：用 (direction==up ? +0.4 : -0.4) 兜底
- *   2. predicted_change_pct 与 direction 符号需一致；不一致时取符号校正
- *   3. low/high 缺失则按 confidence 推算区间宽度
- *   4. magnitude_bucket 缺失或与 |pct| 不匹配则按 inferBucket 重算
+ *   1. hold 方向：predicted_change_pct 强制设为 0，区间对称
+ *   2. 若缺 predicted_change_pct：用 (direction==up ? +0.4 : direction==down ? -0.4 : 0) 兜底
+ *   3. predicted_change_pct 与 direction 符号需一致；不一致时取符号校正
+ *   4. low/high 缺失则按 realized volatility 或 confidence 推算区间宽度
+ *   5. magnitude_bucket 缺失或与 |pct| 不匹配则按 inferBucket 重算
  */
-export function normalizeMultiSignalPrediction(p: MultiSignalPrediction): MultiSignalPrediction {
-  // 检测 prompt 示例值污染：LLM 直接复制了示例中的 0.85
+export function normalizeMultiSignalPrediction(
+  p: MultiSignalPrediction,
+  rvHalfWidth?: number
+): MultiSignalPrediction {
+  // 检测 prompt 示例值污染
   if (p.predicted_change_pct === 0.85 && p.confidence === 0.78) {
     logStage({
       stage: "predict.prompt_value_pollution_detected",
       ok: false,
       warning: "LLM 疑似复制了 prompt 示例值 (predicted_change_pct=0.85, confidence=0.78)",
     });
+  }
+
+  // hold 方向特殊处理
+  if (p.direction === "hold") {
+    const halfWidth = rvHalfWidth ?? Math.max(0.3, (1.2 - Math.min(0.95, Math.max(0.5, p.confidence))) / 2);
+    return {
+      ...p,
+      predicted_change_pct: 0,
+      predicted_change_pct_low: Number((-halfWidth).toFixed(3)),
+      predicted_change_pct_high: Number(halfWidth.toFixed(3)),
+      magnitude_bucket: "small",
+    };
   }
 
   let pct = p.predicted_change_pct;
@@ -615,8 +836,8 @@ export function normalizeMultiSignalPrediction(p: MultiSignalPrediction): MultiS
   if (p.direction === "up" && pct < 0) pct = Math.abs(pct);
   if (p.direction === "down" && pct > 0) pct = -Math.abs(pct);
 
-  // 区间
-  const halfWidth = Math.max(0.2, (1.2 - Math.min(0.95, Math.max(0.5, p.confidence))) / 2);
+  // 区间：优先使用基于 realized volatility 的半宽
+  const halfWidth = rvHalfWidth ?? Math.max(0.2, (1.2 - Math.min(0.95, Math.max(0.5, p.confidence))) / 2);
   let low = p.predicted_change_pct_low;
   let high = p.predicted_change_pct_high;
   if (low == null || high == null || !Number.isFinite(low) || !Number.isFinite(high)) {
@@ -659,6 +880,8 @@ interface MultiSignalContext {
   /** 维度 10：股指期货升贴水（最新一日） */
   futuresBasis: FuturesBasisRow[];
   dimensionsAvailable: number;
+  /** 近 20 日 realized volatility（change_pct 标准差） */
+  realizedVolatility: number | null;
 }
 
 export function gatherMultiSignalContext(
@@ -719,6 +942,8 @@ export function gatherMultiSignalContext(
   if (externalProxy.length > 0) dims += 1;
   if (futuresBasis.length > 0) dims += 1;
 
+  const rv = realizedVolatility(recent30, 20);
+
   return {
     indexCode,
     indexName: meta.index_name,
@@ -735,6 +960,7 @@ export function gatherMultiSignalContext(
     externalCnhRecent,
     futuresBasis,
     dimensionsAvailable: dims,
+    realizedVolatility: rv,
   };
 }
 
@@ -847,6 +1073,13 @@ export function buildMultiSignalUserPrompt(ctx: MultiSignalContext): string {
   sections.push("");
   sections.push(formatLongWindowSummary(win60, "近 60 日"));
   sections.push(formatLongWindowSummary(win90, "近 90 日"));
+  sections.push("");
+
+  sections.push(`========== 维度 1b：预计算技术指标（已本地验证，禁止编造） ==========`);
+  sections.push(formatTechnicalIndicators(ctx.recent30));
+  if (ctx.realizedVolatility != null) {
+    sections.push(`近20日 realized volatility: ${ctx.realizedVolatility.toFixed(3)}%`);
+  }
   sections.push("");
 
   sections.push(`========== 维度 2/7：当日量能 + 异动信号 ==========`);
@@ -980,12 +1213,14 @@ export async function predictNextTradingDay(
 
   const lastDay = ctx.recent30[ctx.recent30.length - 1];
   const lastPct = lastDay.change_pct ?? 0;
+  // 数据严重不足时 fallback 给 hold
+  const fallbackDir: "up" | "down" | "hold" = ctx.dimensionsAvailable < 4 ? "hold" : lastPct >= 0 ? "up" : "down";
   const fallback: MultiSignalPrediction = {
-    direction: lastPct >= 0 ? "up" : "down",
-    confidence: 0.5,
-    predicted_change_pct: lastPct >= 0 ? 0.3 : -0.3,
-    predicted_change_pct_low: lastPct >= 0 ? -0.1 : -0.7,
-    predicted_change_pct_high: lastPct >= 0 ? 0.7 : 0.1,
+    direction: fallbackDir,
+    confidence: 0.52,
+    predicted_change_pct: fallbackDir === "hold" ? 0 : lastPct >= 0 ? 0.3 : -0.3,
+    predicted_change_pct_low: fallbackDir === "hold" ? -0.4 : lastPct >= 0 ? -0.1 : -0.7,
+    predicted_change_pct_high: fallbackDir === "hold" ? 0.4 : lastPct >= 0 ? 0.7 : 0.1,
     magnitude_bucket: "small",
     rationale: "（兜底）LLM 不可用或解析失败，按最近一日方向给出弱信号。",
     signals: {
@@ -1010,8 +1245,13 @@ export async function predictNextTradingDay(
       raw_preview: raw.slice(0, 300),
     });
   }
-  const normalized = normalizeMultiSignalPrediction(parsed);
+  // 基于 realized volatility 计算区间半宽
+  const rvHalfWidth = ctx.realizedVolatility != null
+    ? volatilityBasedHalfWidth(ctx.recent30, parsed.confidence)
+    : undefined;
+  const normalized = normalizeMultiSignalPrediction(parsed, rvHalfWidth);
 
+  const dirLabel = normalized.direction === "up" ? "买涨" : normalized.direction === "down" ? "买跌" : "观望";
   const features: Record<string, unknown> = {
     last_prediction: {
       direction: normalized.direction,
@@ -1027,12 +1267,11 @@ export async function predictNextTradingDay(
       window_days: ctx.windowDays,
       window_start: ctx.earliest30,
       predicted_at: new Date().toISOString(),
-      mode: "multi-signal-v2",
+      mode: "multi-signal-v3",
+      realized_volatility: ctx.realizedVolatility,
     },
   };
-  const summaryBody = `基于 10 维多信号实时分析（${ctx.dimensionsAvailable}/10 维度齐备）：${
-    normalized.direction === "up" ? "买涨" : "买跌"
-  }（置信度 ${(normalized.confidence * 100).toFixed(1)}%，预测 ${
+  const summaryBody = `基于 10 维多信号实时分析（${ctx.dimensionsAvailable}/10 维度齐备）：${dirLabel}（置信度 ${(normalized.confidence * 100).toFixed(1)}%，预测 ${
     normalized.predicted_change_pct != null
       ? (normalized.predicted_change_pct >= 0 ? "+" : "") +
         normalized.predicted_change_pct.toFixed(2) +
@@ -1040,6 +1279,8 @@ export async function predictNextTradingDay(
       : "-"
   }）。${normalized.rationale}`;
   const newMemory = appendMemory(indexCode, ctx.asOfDate, summaryBody, features);
+
+  const calibrated = calibrateConfidence(normalized.confidence);
 
   const result: PredictionResult = {
     index_code: indexCode,
@@ -1055,6 +1296,7 @@ export async function predictNextTradingDay(
     predicted_change_pct_low: normalized.predicted_change_pct_low,
     predicted_change_pct_high: normalized.predicted_change_pct_high,
     magnitude_bucket: normalized.magnitude_bucket,
+    calibrated_confidence: calibrated,
   };
   logStage({
     stage: "predict.done",
@@ -1064,7 +1306,7 @@ export async function predictNextTradingDay(
     confidence: result.confidence,
     version: result.version,
     dimensions_used: ctx.dimensionsAvailable,
-    mode: "multi-signal-30d",
+    mode: "multi-signal-v3",
   });
   return result;
 }

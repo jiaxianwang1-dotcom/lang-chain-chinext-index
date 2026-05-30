@@ -89,13 +89,15 @@
     HSTECH: "恒生科技 HSTECH",
     "510300": "沪深300 ETF (510300)",
     "159915": "创业板 ETF (159915)",
+    A50: "富时A50期货",
+    KWEB: "中概互联网ETF (KWEB)",
   };
 
   function renderExternal(latest, cnhRecent) {
     if (!latest || latest.length === 0) {
       return emptyHint("外资代理数据为空。点击「即时采集」可拉取实时数据。");
     }
-    const order = ["CNH", "HSI", "HSTECH", "510300", "159915"];
+    const order = ["CNH", "HSI", "HSTECH", "510300", "159915", "A50", "KWEB"];
     const byKey = new Map(latest.map((r) => [r.symbol, r]));
     const rows = order
       .filter((k) => byKey.has(k))
