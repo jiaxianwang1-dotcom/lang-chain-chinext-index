@@ -290,7 +290,7 @@ export async function runSnapshot(opts: RunOnceOptions = {}): Promise<void> {
   await safeStep("ingest_breadth", () => ingestMarketBreadth(tradeDate));
   await safeStep("ingest_sector", () => ingestSectorRotation(tradeDate));
   await safeStep("ingest_lhb", () => ingestLhb(tradeDate));
-  await safeStep("classify_news", () => classifyTodayNews(today));
+  await safeStep("classify_news", () => classifyTodayNews(today, { force: true }));
   await safeStep("ingest_external", () => ingestExternalProxies(tradeDate));
   await safeStep("ingest_futures", () => ingestFuturesBasis(tradeDate));
   await safeStep("seed_macro", async () => {
@@ -308,7 +308,7 @@ export async function runOnce(opts: RunOnceOptions = {}): Promise<void> {
   if (ingested.length === 0) {
     // 非交易日：行情没有更新，但新闻是实时的，不受交易日限制
     logStage({ stage: "runOnce.skip_non_trading", ok: true });
-    await safeStep("classify_news", () => classifyTodayNews(today));
+    await safeStep("classify_news", () => classifyTodayNews(today, { force: true }));
     return;
   }
   const tradeDate = ingested[0].trade_date;
@@ -326,7 +326,7 @@ export async function runOnce(opts: RunOnceOptions = {}): Promise<void> {
   await safeStep("ingest_sector", () => ingestSectorRotation(tradeDate));
   await safeStep("ingest_lhb", () => ingestLhb(tradeDate));
   // 新闻用 today：交易日 today===tradeDate，语义一致；非交易日上面已处理
-  await safeStep("classify_news", () => classifyTodayNews(today));
+  await safeStep("classify_news", () => classifyTodayNews(today, { force: true }));
   // P1：新维度
   await safeStep("ingest_external", () => ingestExternalProxies(tradeDate));
   await safeStep("ingest_futures", () => ingestFuturesBasis(tradeDate));
