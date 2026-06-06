@@ -1,0 +1,32 @@
+src/agent/stock/__tests__/prediction.test.ts
+  s_4d22936b23d66c::t_589cd552e989c0 229
+src/agent/stock/prediction/index.ts
+  s_4d22936b23d66c::t_8e30c5f1994299 1209-1213,1217-1221,1239
+  s_4d22936b23d66c::t_b5122be4e9e15b 1559,1561
+  s_4d22936b23d66c::t_f38ae11e50179c 1599
+  s_4d22936b23d66c::t_531dea1514039e 929-1143
+  s_4d22936b23d66c::t_01e48ece4ed1d2 1188-1195,1214-1216
+  s_4d22936b23d66c::t_352349ff575988 577,581-582,587-592
+  s_4d22936b23d66c::t_8e384526228a86 1537,1539
+  s_4d22936b23d66c::t_b928aba42c72c9 925-926
+  s_4d22936b23d66c::t_e6982e3df8d7a4 197,199,221-237,242,244-248,250,253-264,273,280,284-287,293,298
+  s_4d22936b23d66c::t_49496812dd4218 1397-1409
+optimize/2026-0607-优化总结.md
+  s_4d22936b23d66c::t_482ee50b6da041 1-109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.10-trip",
+  "base_commit_sha": "25c045f0cf0700726c70b27ba2eaf8554cdba5eb",
+  "prompts": {},
+  "sessions": {
+    "s_4d22936b23d66c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "001cd93f-412e-403d-84ee-2334259a3bcd",
+        "model": "Kimi K2.6"
+      },
+      "human_author": "jiaxianwang <jiaxianwang@trip.com>"
+    }
+  }
+}
