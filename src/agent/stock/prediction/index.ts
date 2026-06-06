@@ -194,9 +194,9 @@ date / open / high / low / close / chg% / volume / reason
 
 export function buildMultiSignalSystemPrompt(indexName = "大盘"): string {
   const prefix = indexName === "上证指数" || indexName === "大盘" ? "A 股大盘" : indexName;
-  return `你是 ${prefix}短线方向 + 涨跌幅判断助手（多信号模式 v3）。
+  return `你是 ${prefix}短线方向 + 涨跌幅判断助手（多信号模式 v4）。
 
-你将收到 **最多 10 个维度 + 预计算技术指标**的真实数据用于分析"下一交易日"方向（"up"=买涨 / "down"=买跌 / "hold"=方向不明，建议观望）以及预测涨跌幅区间：
+你将收到 **最多 10 个维度 + 预计算技术指标 + 本地量化评分**的真实数据用于分析"下一交易日"方向（"up"=买涨 / "down"=买跌 / "hold"=方向不明，建议观望）以及预测涨跌幅区间：
 
 【维度 1：价格趋势】近 30 日 OHLCV 明细 + 60/90 日统计摘要
 【维度 1b：预计算技术指标】MA5/MA10/MA20、MACD(12,26,9)、RSI(14)、布林带(20,2)、近期跳空缺口、连涨/连跌天数
@@ -218,19 +218,49 @@ export function buildMultiSignalSystemPrompt(indexName = "大盘"): string {
 4. 量价趋势 + 技术指标（维度 1、1b、2）—— 技术面验证
 5. 板块轮动 + 市场广度（维度 4、5）—— 市场情绪
 
+============ 预计算信号评分（代码层量化，供你参考校准） ============
+
+用户 prompt 中会附带本地预计算的"三核评分"，范围 -3~+3：
+- **资金面评分（fundFlow）**：综合融资 5 日累计净买入、期货升贴水、量比
+- **技术面评分（technical）**：综合均线排列、MACD、RSI、连涨连跌、缺口、布林带
+- **外部市场评分（external）**：综合 CNH、恒指、ETF 表现
+
+以及**信号共振结论（resonance）**：
+- strong_bear：≥2 个核心维度强烈偏空，或资金面≤-2 且另有维度偏空
+- bear：≥2 个核心维度偏空且无多头对冲
+- strong_bull：≥2 个核心维度强烈偏多，或资金面≥+2 且另有维度偏多
+- bull：≥2 个核心维度偏多且无空头压制
+- conflict：核心维度多空互现
+- neutral：信号平淡
+
+**重要**：预计算评分是基于规则的量化参考，你应结合 10 维原始数据独立判断，但当 resonance 为 strong_bear/strong_bull 时，说明多维度已形成同向共振，**不要人为给出相反方向**。
+
 ============ 硬性纪律（违反则视为不合格输出）============
 
 A. **禁止编造**：你只能引用上述数据中**实际出现的数字与文本**。如果某维度被标注 "<数据缺失>"，rationale 中 MUST NOT 编造该维度的数字。
 A2. **禁止张冠李戴**：引用明细中的具体日期与数值时，必须严格一一对应。不得把其他交易日的数据套用到错误日期上。若记不清，宁可不引用，也不准猜测。
-B. **direction 允许 hold**：当多个核心维度（政策/期货/龙虎榜/新闻）方向互相矛盾，或信号极其微弱时，**必须**输出 "hold"，不要强行二选一。hold 时 confidence 应在 [0.50, 0.58]。
+B. **hold 的严格条件**：只有在"信号共振为 conflict"或"neutral"时才允许给 hold。当 resonance 为 strong_bear / bear / strong_bull / bull 时，**禁止 hold**，必须给出对应方向。hold 时 confidence 应在 [0.50, 0.58]。
 C. **维度覆盖**：rationale ≤ 280 字，引用**你认为重要**的维度（≥2 个），每条证据必须包含具体数字或专有名词。不重要的维度不必硬凑。
-D. **维度冲突时降低置信度或 hold**：当核心维度方向相反（例如技术面向多但期货深度贴水 + 新闻偏负面）时，优先降低 confidence 到 [0.55, 0.65]；若冲突严重，直接给 hold。
-E. **置信度梯度**：
-   - 多核心维度（政策/期货/资金）一致同向 + 信号明确 → 0.75–0.90
-   - 多维度一致但信号温和 → 0.65–0.75
+D. **维度冲突时降低置信度**：当核心维度方向相反（例如技术面向多但期货深度贴水 + 新闻偏负面）时，优先降低 confidence 到 [0.55, 0.65]；若冲突严重且预计算评分为 conflict，才给 hold。
+E. **置信度梯度（v4 校准）**：
+   - strong_bear / strong_bull 共振 + 多维度一致 → 0.78–0.90
+   - bear / bull 共振 + 信号明确 → 0.68–0.78
+   - 多维度一致但信号温和 → 0.60–0.70
    - 主导维度不足 / 非核心维度冲突 → 0.55–0.65
-   - 核心维度冲突 / 数据混乱 / 缺维度 ≥ 4 → 0.50–0.60（或 hold）
+   - 核心维度冲突 / 数据混乱 / 缺维度 ≥ 4 / neutral → 0.50–0.58（或 hold）
    不允许 0.95+ 极端值，也不允许刻意压低到 0.48 以下。
+
+============ 资金面破位专项规则 ============
+
+当以下**资金面三杀**信号同时出现时，视为"资金面破位"，必须看空且 confidence ≥ 0.72：
+- 融资 5 日累计净卖出 > 100 亿（或单日净卖出 > 50 亿）
+- 期货 2 个及以上合约贴水（basis_pct < -0.3%）
+- 量比 < 0.9（缩量观望，机构未进场承接）
+
+当以下**资金面强势**信号同时出现时，视为"资金抢筹"，必须看多且 confidence ≥ 0.72：
+- 融资 5 日累计净买入 > 100 亿
+- 期货 2 个及以上合约升水（basis_pct > +0.3%）
+- 量比 > 1.2（有资金真金白银入场）
 
 ============ 涨跌幅与档位 ============
 
@@ -240,27 +270,32 @@ G. **区间预测**: predicted_change_pct_low 与 predicted_change_pct_high 给�
    规则：区间宽度参考近20日 realized volatility（已提供）。confidence 越高，区间可越窄。
    方向是 up 时：low ≥ -0.3，high > predicted_change_pct；
    方向是 down 时：high ≤ +0.3，low < predicted_change_pct；
-   hold 时：区间以 0 为中心对称，如 -0.4 ~ +0.4。
+   hold 时：区间以 0 为中心对称，宽度至少为 realized volatility 的 1.2 倍（如 rv=0.8 则至少 -0.96~+0.96）。
    low 必须严格 ≤ high。
 H. **magnitude_bucket**: 按 |predicted_change_pct| 判档位：
    |x| < 0.5%  → "small"
    0.5% ≤ |x| < 1.5% → "medium"
    |x| ≥ 1.5% → "large"
 
-============ "异动信号"专项提醒 ============
+============ "异动信号"专项提醒（v4 增强） ============
 
 - 量比 > 1.5 + 当日 |chg%| < 1.0 → "高量低波"，可能有人在静默吸筹/出货，需结合龙虎榜判断方向
 - 量比 > 1.5 + 指数明显上行 → 放量上行，趋势加强信号
-- 量比 < 0.7 + 微跌 → 缩量调整，下跌动能不足
+- 量比 < 0.7 + 微跌 → 缩量调整，下跌动能不足（但如果跌破关键均线则可能是阴跌中继）
+- **量比 < 0.9 + 指数下跌 + 期货贴水** → 缩量阴跌，机构避险，破位风险高
+- **融资连续 3 日以上净卖出 + 累计 > 50 亿** → 杠杆资金撤退，看空信号
+- **期货全面贴水（IF+IC+IM 同时 basis_pct < -0.3%）** → 机构集体看空远期，强烈谨慎
 - 龙虎榜净买入 > 50 亿（全市场成分） + 集中某板块 → 机构看好该板块，与维度 5 行业轮动交叉验证
 - 期货深度贴水（IF/IC basis_pct < -0.8%）→ 机构悲观，倾向下行
 - 期货明显升水（basis_pct > +0.3%）→ 机构看多，倾向上行
 - CNH 走强（人民币贬值）→ 外资倾向流出，谨慎
 - 恒指当日 +1% 以上 → 港股领涨往往传导到 A 股次日
+- **恒指当日 -2% 以上** → 港股暴跌往往传导到 A 股次日，强烈谨慎
 - RSI > 70 → 短期超买，追高风险
 - RSI < 30 → 短期超卖，反弹概率增加
 - 连涨 4+ 天 → 均值回归概率上升，不宜追高
 - 连跌 4+ 天 → 超跌反弹概率上升，不宜杀跌
+- **均线空头排列 + MACD 绿柱 + 缩量** → 三重空头确认，不要轻易抄底
 
 ============ 输出格式（严格 JSON，不要 Markdown）============
 
@@ -539,17 +574,22 @@ function formatTechnicalIndicators(rows: IndexQuoteRow[]): string {
 }
 
 /** 基于历史 realized volatility 计算推荐的区间半宽 */
-function volatilityBasedHalfWidth(rows: IndexQuoteRow[], confidence: number): number {
+function volatilityBasedHalfWidth(rows: IndexQuoteRow[], confidence: number, isHold = false): number {
   const rv = realizedVolatility(rows, 20);
   if (rv == null) {
     // 回退到原来的公式
-    return Math.max(0.2, (1.2 - Math.min(0.95, Math.max(0.5, confidence))) / 2);
+    const base = Math.max(0.2, (1.2 - Math.min(0.95, Math.max(0.5, confidence))) / 2);
+    return isHold ? Math.max(0.4, base * 1.3) : base;
   }
   // realized vol 是日 change_pct 的标准差，约 68% 概率落在 ±1σ
   // 我们想要约 70% 置信区间，用 1.0σ 作为基准
   // confidence 越高，区间可以越窄（模型越确定）
-  const sigmaMultiplier = Math.max(0.5, 1.5 - confidence);
-  return Math.max(0.15, rv * sigmaMultiplier);
+  // hold 时不确定性更高，区间应更宽（sigma 乘数更大）
+  const sigmaMultiplier = isHold
+    ? Math.max(0.8, 1.8 - confidence)
+    : Math.max(0.5, 1.5 - confidence);
+  const halfWidth = rv * sigmaMultiplier;
+  return isHold ? Math.max(0.4, halfWidth) : Math.max(0.15, halfWidth);
 }
 
 // ==================== Bootstrap ====================
@@ -882,6 +922,225 @@ interface MultiSignalContext {
   dimensionsAvailable: number;
   /** 近 20 日 realized volatility（change_pct 标准差） */
   realizedVolatility: number | null;
+  /** 预计算信号评分（v4 增强） */
+  precomputedScores: PrecomputedScores;
+}
+
+// ==================== 预计算信号评分（v4 增强）====================
+
+export interface PrecomputedScores {
+  /** 资金面综合评分 -3~+3，负值看空 */
+  fundFlow: number;
+  /** 技术面趋势评分 -3~+3 */
+  technical: number;
+  /** 外部市场评分 -3~+3 */
+  external: number;
+  /** 信号共振结论 */
+  resonance: "strong_bear" | "bear" | "neutral" | "bull" | "strong_bull" | "conflict";
+  /** 共振判定理由 */
+  resonanceRationale: string;
+}
+
+/** 计算资金面综合评分 */
+function computeFundFlowScore(
+  margins: MarginBalanceRow[],
+  futures: FuturesBasisRow[],
+  signals: AnomalySignals,
+  latestQuote: IndexQuoteRow
+): number {
+  let score = 0;
+
+  // 1. 融资净买入 5 日累计（最核心的资金情绪指标）
+  if (margins.length >= 3) {
+    const latestMargin = margins[margins.length - 1];
+    const net5d = latestMargin.finance_net_5d ?? 0; // 单位：元
+    const net5dYi = net5d / 1e8; // 转为亿
+    if (net5dYi < -200) score -= 2.0;
+    else if (net5dYi < -100) score -= 1.5;
+    else if (net5dYi < -50) score -= 1.0;
+    else if (net5dYi < -20) score -= 0.5;
+    else if (net5dYi > 200) score += 2.0;
+    else if (net5dYi > 100) score += 1.5;
+    else if (net5dYi > 50) score += 1.0;
+    else if (net5dYi > 20) score += 0.5;
+
+    // 融资净买入连续恶化（最近3日趋势）
+    const recent3 = margins.slice(-3);
+    const allNegative = recent3.length === 3 && recent3.every((m) => (m.finance_net ?? 0) < 0);
+    const allPositive = recent3.length === 3 && recent3.every((m) => (m.finance_net ?? 0) > 0);
+    if (allNegative) score -= 0.5;
+    if (allPositive) score += 0.5;
+  }
+
+  // 2. 期货升贴水（机构真实态度）
+  if (futures.length > 0) {
+    const deepDiscount = futures.filter((f) => (f.basis_pct ?? 0) < -0.8).length;
+    const moderateDiscount = futures.filter((f) => (f.basis_pct ?? 0) < -0.3).length;
+    const premium = futures.filter((f) => (f.basis_pct ?? 0) > 0.3).length;
+    if (deepDiscount >= 2) score -= 1.5;
+    else if (moderateDiscount >= 2) score -= 0.8;
+    else if (moderateDiscount >= 1) score -= 0.4;
+    if (premium >= 2) score += 1.0;
+    else if (premium >= 1) score += 0.5;
+  }
+
+  // 3. 量比与价格配合（量价关系）
+  const vr = signals.volume_ratio;
+  const chg = latestQuote.change_pct ?? 0;
+  if (vr != null) {
+    if (vr < 0.7) {
+      // 缩量：下跌时恐慌不足可能继续跌；上涨时动能不足
+      if (chg < -0.3) score -= 0.5; // 缩量阴跌，机构未进场
+      else if (chg > 0.3) score += 0.3; // 缩量上涨，抛压轻
+    } else if (vr > 1.5) {
+      // 放量：需结合方向
+      if (chg < -0.5) score -= 0.8; // 放量下跌，恐慌出逃
+      else if (chg > 0.5) score += 0.8; // 放量上涨，资金进场
+    }
+  }
+
+  return Math.max(-3, Math.min(3, score));
+}
+
+/** 计算技术面趋势评分 */
+function computeTechnicalScore(rows: IndexQuoteRow[]): number {
+  if (rows.length < 20) return 0;
+  const closes = rows.map((r) => r.close_value).filter((v): v is number => Number.isFinite(v));
+  if (closes.length < 20) return 0;
+
+  let score = 0;
+
+  // 均线排列
+  const ma5 = sma(closes, 5);
+  const ma10 = sma(closes, 10);
+  const ma20 = sma(closes, 20);
+  if (ma5 && ma10 && ma20) {
+    if (ma5 > ma10 && ma10 > ma20) score += 1.5; // 多头排列
+    else if (ma5 < ma10 && ma10 < ma20) score -= 1.5; // 空头排列
+  }
+
+  // MACD
+  const macd = macdLatest(closes);
+  if (macd.dif != null && macd.dea != null && macd.macd != null) {
+    if (macd.dif < macd.dea && macd.macd < 0) score -= 1.0; // 死叉且绿柱
+    else if (macd.dif > macd.dea && macd.macd > 0) score += 1.0; // 金叉且红柱
+    else if (macd.dif < macd.dea) score -= 0.5; // 死叉
+    else if (macd.dif > macd.dea) score += 0.5; // 金叉
+  }
+
+  // RSI
+  const rsi = rsiLatest(closes);
+  if (rsi != null) {
+    if (rsi > 70) score -= 0.5; // 超买
+    else if (rsi < 30) score += 0.5; // 超卖
+  }
+
+  // 连涨/连跌（均值回归）
+  const streak = consecutiveDays(rows);
+  if (streak.count >= 4) {
+    if (streak.direction === "up") score -= 0.5; // 连涨4天+，回调风险
+    else if (streak.direction === "down") score += 0.5; // 连跌4天+，反弹概率
+  }
+
+  // 缺口
+  const gap = findRecentGap(rows);
+  if (gap.includes("向下缺口")) score -= 0.5;
+  else if (gap.includes("向上缺口")) score += 0.5;
+
+  // 当前价格相对布林带位置
+  const bb = bollingerLatest(closes);
+  const lastClose = closes[closes.length - 1];
+  if (bb.upper != null && bb.lower != null) {
+    if (lastClose > bb.upper) score -= 0.5; // 突破上轨
+    else if (lastClose < bb.lower) score += 0.5; // 跌破下轨
+  }
+
+  return Math.max(-3, Math.min(3, score));
+}
+
+/** 计算外部市场评分 */
+function computeExternalScore(proxy: ExternalProxyRow[]): number {
+  if (proxy.length === 0) return 0;
+  const byKey = new Map(proxy.map((r) => [r.symbol, r]));
+  let score = 0;
+
+  const cnh = byKey.get("CNH");
+  const hsi = byKey.get("HSI");
+  const hstech = byKey.get("HSTECH");
+  const etf300 = byKey.get("510300");
+  const etfCyb = byKey.get("159915");
+
+  // CNH：走弱(贬值)=外资流出成本下降但信心不足，走强=外资流入意愿强
+  // 注意：CNH 数值是 USD/CNH，上升=人民币贬值(走弱)，下降=升值(走强)
+  if (cnh?.change_pct != null) {
+    if (cnh.change_pct > 0.3) score -= 0.8; // 明显贬值
+    else if (cnh.change_pct > 0.15) score -= 0.4; // 温和贬值
+    else if (cnh.change_pct < -0.3) score += 0.8; // 明显升值
+    else if (cnh.change_pct < -0.15) score += 0.4; // 温和升值
+  }
+
+  // 恒指：港股与A股高度联动
+  if (hsi?.change_pct != null) {
+    if (hsi.change_pct < -2) score -= 1.5;
+    else if (hsi.change_pct < -1) score -= 1.0;
+    else if (hsi.change_pct < -0.5) score -= 0.5;
+    else if (hsi.change_pct > 2) score += 1.5;
+    else if (hsi.change_pct > 1) score += 1.0;
+    else if (hsi.change_pct > 0.5) score += 0.5;
+  }
+
+  // 恒生科技（弹性更大）
+  if (hstech?.change_pct != null) {
+    if (hstech.change_pct < -2.5) score -= 0.5;
+    else if (hstech.change_pct > 2.5) score += 0.5;
+  }
+
+  // ETF 代理（与指数直接相关）
+  const etfChg = etf300?.change_pct ?? etfCyb?.change_pct;
+  if (etfChg != null) {
+    if (etfChg < -1.5) score -= 0.5;
+    else if (etfChg > 1.5) score += 0.5;
+  }
+
+  return Math.max(-3, Math.min(3, score));
+}
+
+/** 计算信号共振结论 */
+function computeResonance(
+  scores: PrecomputedScores,
+  newsSentiment: number // 新闻情绪评分，正数看多，负数看空
+): PrecomputedScores {
+  const { fundFlow, technical, external } = scores;
+  const coreScores = [fundFlow, technical, external];
+  const bearishCount = coreScores.filter((s) => s < -0.5).length;
+  const bullishCount = coreScores.filter((s) => s > 0.5).length;
+  const strongBearishCount = coreScores.filter((s) => s <= -1.5).length;
+  const strongBullishCount = coreScores.filter((s) => s >= 1.5).length;
+
+  let resonance: PrecomputedScores["resonance"] = "neutral";
+  let rationale = "";
+
+  if (strongBearishCount >= 2 || (fundFlow <= -2 && bearishCount >= 2)) {
+    resonance = "strong_bear";
+    rationale = `强烈看空共振：资金面${fundFlow.toFixed(1)}分/技术面${technical.toFixed(1)}分/外部${external.toFixed(1)}分，多维度同向恶化，机构避险意愿强烈`;
+  } else if (bearishCount >= 2 && bullishCount === 0) {
+    resonance = "bear";
+    rationale = `看空共振：${bearishCount}个核心维度偏空，无多头对冲`;
+  } else if (strongBullishCount >= 2 || (fundFlow >= 2 && bullishCount >= 2)) {
+    resonance = "strong_bull";
+    rationale = `强烈看多共振：资金面${fundFlow.toFixed(1)}分/技术面${technical.toFixed(1)}分/外部${external.toFixed(1)}分，多维度同步改善`;
+  } else if (bullishCount >= 2 && bearishCount === 0) {
+    resonance = "bull";
+    rationale = `看多共振：${bullishCount}个核心维度偏多，无空头压制`;
+  } else if (bearishCount >= 1 && bullishCount >= 1) {
+    resonance = "conflict";
+    rationale = `多空冲突：${bearishCount}个维度偏空 vs ${bullishCount}个维度偏多`;
+  } else {
+    resonance = "neutral";
+    rationale = `信号平淡：核心维度无明确方向`;
+  }
+
+  return { ...scores, resonance, resonanceRationale: rationale };
 }
 
 export function gatherMultiSignalContext(
@@ -926,23 +1185,39 @@ export function gatherMultiSignalContext(
   // 维度 10：股指期货升贴水
   const futuresBasis = getLatestFuturesBasis();
 
+  // 新闻维度：覆盖 [lastTradingDate, today] 新事件 + 仍在有效期内的历史大事件
+  // 提前查询，供维度计数和预计算评分共享
+  const today = todayShanghai();
+  const rangeNews = getNewsInRange(latest.trade_date, today, 100);
+  const activeNews = getActiveNews(today, 100);
+  const allNewsToday = [...rangeNews, ...activeNews];
+  const hasNewsToday = allNewsToday.length > 0;
+
   // 计数：trend(总有) + volume(总有) + 7 个外部维度
   let dims = 2; // trend + volume
   if (margin30.length > 0) dims += 1;
   if (breadth30.length > 0) dims += 1;
   if (sector.length > 0) dims += 1;
   if (signals.lhb_active) dims += 1;
-  const today = todayShanghai();
-  // 新闻维度：覆盖 [lastTradingDate, today] 新事件 + 仍在有效期内的历史大事件
-  const rangeNews = getNewsInRange(latest.trade_date, today, 1);
-  const activeNews = getActiveNews(today, 1);
-  const hasNewsToday = rangeNews.length > 0 || activeNews.length > 0;
   if (hasNewsToday) dims += 1;
   if (macroEvents.length > 0) dims += 1;
   if (externalProxy.length > 0) dims += 1;
   if (futuresBasis.length > 0) dims += 1;
 
   const rv = realizedVolatility(recent30, 20);
+
+  // 预计算信号评分（v4 增强）
+  const fundFlowScore = computeFundFlowScore(margin30, futuresBasis, signals, latest);
+  const technicalScore = computeTechnicalScore(recent30);
+  const externalScore = computeExternalScore(externalProxy);
+  // 简化新闻情绪：取最近新闻的平均 sentiment
+  const newsSentiment = allNewsToday.length > 0
+    ? allNewsToday.reduce((sum, n) => sum + (n.sentiment ?? 0), 0) / allNewsToday.length
+    : 0;
+  const precomputedScores = computeResonance(
+    { fundFlow: fundFlowScore, technical: technicalScore, external: externalScore, resonance: "neutral", resonanceRationale: "" },
+    newsSentiment
+  );
 
   return {
     indexCode,
@@ -961,6 +1236,7 @@ export function gatherMultiSignalContext(
     futuresBasis,
     dimensionsAvailable: dims,
     realizedVolatility: rv,
+    precomputedScores,
   };
 }
 
@@ -1118,6 +1394,19 @@ export function buildMultiSignalUserPrompt(ctx: MultiSignalContext): string {
   sections.push(formatFuturesBasis(ctx.futuresBasis));
   sections.push("");
 
+  sections.push(`========== 预计算信号评分（v4 本地量化，供参考校准） ==========`);
+  const s = ctx.precomputedScores;
+  const scoreBar = (v: number) => {
+    const filled = Math.round(Math.abs(v) * 2);
+    const empty = 6 - filled;
+    const bar = v >= 0 ? "█".repeat(filled) + "░".repeat(empty) + " +" + v.toFixed(1) : "-" + Math.abs(v).toFixed(1) + " " + "░".repeat(empty) + "█".repeat(filled);
+    return bar;
+  };
+  sections.push(`资金面评分: ${scoreBar(s.fundFlow)} | 技术面评分: ${scoreBar(s.technical)} | 外部市场评分: ${scoreBar(s.external)}`);
+  sections.push(`信号共振结论: ${s.resonance} —— ${s.resonanceRationale}`);
+  sections.push("说明：负值=看空，正值=看多，绝对值越大信号越强。当 resonance 为 strong_bear/bear/strong_bull/bull 时，禁止 hold，必须给出对应方向。");
+  sections.push("");
+
   sections.push(`========== 任务 ==========`);
   sections.push(
     `基于以上 10 维真实数据判断"下一交易日"方向（buy=up / buy=down）并预测涨跌幅。`
@@ -1245,9 +1534,9 @@ export async function predictNextTradingDay(
       raw_preview: raw.slice(0, 300),
     });
   }
-  // 基于 realized volatility 计算区间半宽
+  // 基于 realized volatility 计算区间半宽（hold 模式更宽）
   const rvHalfWidth = ctx.realizedVolatility != null
-    ? volatilityBasedHalfWidth(ctx.recent30, parsed.confidence)
+    ? volatilityBasedHalfWidth(ctx.recent30, parsed.confidence, parsed.direction === "hold")
     : undefined;
   const normalized = normalizeMultiSignalPrediction(parsed, rvHalfWidth);
 
@@ -1267,8 +1556,9 @@ export async function predictNextTradingDay(
       window_days: ctx.windowDays,
       window_start: ctx.earliest30,
       predicted_at: new Date().toISOString(),
-      mode: "multi-signal-v3",
+      mode: "multi-signal-v4",
       realized_volatility: ctx.realizedVolatility,
+      precomputed_scores: ctx.precomputedScores,
     },
   };
   const summaryBody = `基于 10 维多信号实时分析（${ctx.dimensionsAvailable}/10 维度齐备）：${dirLabel}（置信度 ${(normalized.confidence * 100).toFixed(1)}%，预测 ${
@@ -1306,7 +1596,7 @@ export async function predictNextTradingDay(
     confidence: result.confidence,
     version: result.version,
     dimensions_used: ctx.dimensionsAvailable,
-    mode: "multi-signal-v3",
+    mode: "multi-signal-v4",
   });
   return result;
 }
